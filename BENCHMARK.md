@@ -109,3 +109,34 @@ Input: Pre-segmented words → is_split_into_words tokenization → first-subwor
    - POS: 特殊/動詞/形容詞/判定詞/助動詞/名詞/指示詞/副詞/助詞/接続詞/連体詞/感動詞/接頭辞/接尾辞
    - NE: O/B-ORG/I-ORG/B-PER/I-PER/B-LOC/I-LOC/B-ART/I-ART/B-DAT/I-DAT/B-TIM/I-TIM/B-MON/I-MON/B-PCT/I-PCT
 3. **No CRF yet**: NER B/I boundaries not guaranteed valid (CRF Viterbi needed for proper NER)
+
+## Seq2seq Module (T5 — reading/lemma/canon)
+
+Model: retrieva-jp/t5-base-long (12 enc + 12 dec layers, vocab=32100, hidden=768)
+Task: Morpheme reading prediction, lemmatization, canonicalization
+
+### Quantization Benchmark (seq2seq standalone, greedy decode)
+
+| Variant | Speed (sent/sec) | Output Match vs FP32 |
+|---------|------------------|---------------------|
+| FP32    | 9.6              | baseline             |
+| Q8      | 13.0             | ✓ identical          |
+| Q4      | 14.5             | ✓ identical          |
+
+### Example Output
+
+```
+Input:  私<del>は<del>学生<del>です  (morphemes joined by <extra_id_5>)
+Output: 私(わたし), は(は), 学生(がくせい), です(です→だ/だ)
+
+Input:  岸田<del>首相<del>が<del>記者<del>会見<del>を<del>行った
+Output: 岸田(きしだ), 首相(しゅしょう), が(が), 記者(きしゃ), 会見(かいけん), を(を), 行った(おこなった)
+```
+
+### Implementation Notes
+
+- T5 does NOT use 1/sqrt(dk) attention scaling (key difference from standard transformer)
+- Uses gated-GeLU FFN (wi_0, wi_1, wo)
+- RMSNorm (no bias) for all layer norms
+- Relative position bias shared from layer 0 (32 buckets × 12 heads)
+- Autoregressive decoding with KV cache
