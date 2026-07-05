@@ -71,3 +71,41 @@ Q4:   日本 / の / 面積 / は / 約 / 三十七万 / 平方キロ / メー�
 | Research/Production | Q8 | Perfect accuracy + fast + small |
 | Edge/Mobile | Q4 | 53MB, negligible quality loss |
 | Debugging | FP32 | Reference |
+
+## Word Module (POS + NER)
+
+Model: ku-nlp/deberta-v2-base-japanese (vocab=32008, 12 layers)
+Task: POS tagging (14 classes) + NER (17 classes, BIO)
+Input: Pre-segmented words → is_split_into_words tokenization → first-subword pooling → classification
+
+### Quantization Benchmark (word module standalone)
+
+| Variant | Speed (sent/sec) | POS Accuracy vs FP32 |
+|---------|------------------|---------------------|
+| FP32    | 79               | 1.000 (baseline)    |
+| FP16    | 188              | 1.000               |
+| Q8      | 210              | 1.000               |
+| Q4      | 217              | 1.000               |
+
+### Full Pipeline (char → word)
+
+| Step | Speed |
+|------|-------|
+| char→word pipeline | 35 sent/sec |
+
+### POS Results (correct!)
+
+```
+私は学生です。     → 私/名詞 は/助詞 学生/名詞 です/判定詞 。/特殊
+東京都庁に行きました  → 東京/名詞[LOC] 都庁/名詞[ORG] に/助詞 行き/動詞 ました/接尾辞
+岸田首相が記者会見を行った → 岸田/名詞[B-PERSON] 首相/名詞 が/助詞 記者/名詞 会見/名詞 を/助詞 行った/動詞
+```
+
+### Key Implementation Notes
+
+1. **Subword pooling required**: Tagger heads operate on word-level, not subword-level
+   - Strategy: FIRST (take first subword's hidden state per word)
+2. **Label ordering from kwja.utils.constants**:
+   - POS: 特殊/動詞/形容詞/判定詞/助動詞/名詞/指示詞/副詞/助詞/接続詞/連体詞/感動詞/接頭辞/接尾辞
+   - NE: O/B-ORG/I-ORG/B-PER/I-PER/B-LOC/I-LOC/B-ART/I-ART/B-DAT/I-DAT/B-TIM/I-TIM/B-MON/I-MON/B-PCT/I-PCT
+3. **No CRF yet**: NER B/I boundaries not guaranteed valid (CRF Viterbi needed for proper NER)
