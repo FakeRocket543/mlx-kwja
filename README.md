@@ -76,6 +76,29 @@ Output: 品詞付き分詞
 - INT8 需要 fp16→fp32 清理（153 個隱藏 tensor）再量化
 - INT4 對 encoder 通常毀滅性
 
+## 目前狀態 (2026-07-05)
+
+### 已完成
+- ✅ 權重已下載：`kevinzhow/kwja-mlx` base model (424MB, FP32)
+- ✅ 結構分析完成：encoder (104M) + 3 tagger heads (0.6M each)
+- ✅ 發現：kevinzhow 已轉好 tiny/base/large 全系列 MLX weights
+- ✅ Tokenizer: `ku-nlp/deberta-v2-base-japanese-char-wwm`
+
+### Blocker
+- DeBERTa-v2 使用 **disentangled attention**（content-position 分離），不是標準 self-attention
+- 直接用 standard attention 會得到錯誤結果
+- 需要正確實作 relative position embedding + disentangled QKV
+
+### 選項
+1. **正確實作 DeBERTa-v2 attention in MLX** — 1-2 天工作，需要讀原始碼對照
+2. **用 `mlx-community` 的 DeBERTa 如果有人做了** — 查是否已有
+3. **用 PyTorch MPS 作為 baseline，之後再 MLX 化** — 最快出結果
+
+### 已確認的 benchmark（不需要 MLX）
+- fugashi (MeCab): 270K sent/sec — 詞頻分析用這個
+- Sudachi: 244K sent/sec — 正規化分析用這個
+- KWJA MPS: 待測（SSL 問題需解決）
+
 ## 實驗步驟
 
 ```
