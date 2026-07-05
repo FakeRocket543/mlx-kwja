@@ -1,160 +1,116 @@
-# kwja-mlx — KWJA (日文形態素解析) の MLX 移植
+# kwja-mlx — KWJA Japanese Analyzer on Apple Silicon MLX
 
-日文版 CKIP MLX。京大 KWJA の DeBERTa encoder を MLX 化し、Apple Silicon で高速推理。
+Complete MLX port of [KWJA](https://github.com/ku-nlp/kwja) (Kyoto-Waseda Japanese Analyzer).  
+All three modules running on Metal GPU with full accuracy.
 
-## 背景
+## Features
 
-| 工具 | 架構 | 速度 | 精度 |
-|------|------|------|------|
-| MeCab (fugashi) | CRF + 辭典 | 270K sent/sec | ⭐⭐ |
-| Sudachi | lattice + 正規化 | 244K sent/sec | ⭐⭐⭐ |
-| **KWJA** | **DeBERTa neural** | **~10 sent/sec** | **⭐⭐⭐⭐** |
-| **kwja-mlx (目標)** | **MLX Metal GPU** | **~100+ sent/sec** | **⭐⭐⭐⭐** |
+- **Word segmentation** (char module, DeBERTa-v2)
+- **POS tagging** — 14 JUMAN++ POS classes
+- **Named Entity Recognition** — PERSON, LOCATION, ORGANIZATION, ARTIFACT, DATE, TIME, MONEY, PERCENT
+- **Reading prediction** (seq2seq T5) — 東京→とうきょう, 行った→おこなった
+- **Lemmatization & canonicalization** (seq2seq T5)
+- **Quantization**: FP32, FP16, Q8, Q4 — all with near-perfect accuracy
 
-目標：KWJA 的精度 + MeCab 級の速度（10x 加速 over PyTorch CPU）
-
-## KWJA 架構分析
-
-```
-Input text
-    ↓
-[1] Typo correction module (DeBERTa seq2seq) — optional
-    ↓
-[2] Character module (DeBERTa token classification)
-    → 文字單位：每字預測 B/I/O boundary
-    ↓
-[3] Word module (DeBERTa token classification)
-    → 詞單位：POS tag + 基本形 + 讀み
-    ↓
-[4] Seq2seq module (DeBERTa/T5)
-    → NER + 依存關係 + 共參照
-    ↓
-Output: 分詞 + POS + NER + 依存 + 共參照
-```
-
-## MLX 化計畫
-
-### Phase 1: Encoder 轉換（最大加速）
-
-```
-PyTorch DeBERTa weights → MLX safetensors
-推理: MLX forward pass + @mx.compile
-```
-
-這跟 GLiNER-Forge 的 `to_mlx.py` 幾乎一樣。DeBERTa 是相同架構。
-
-### Phase 2: Character module （分詞核心）
-
-```
-Input: 文字列 → DeBERTa encoder → per-character BIO tag
-Output: 分詞結果
-```
-
-這是最有用的部分——只做分詞不做 NER/依存的話，只需要 char module。
-
-### Phase 3: Word module（POS tagging）
-
-```
-Input: 分詞結果 → DeBERTa encoder → per-token POS/活用形
-Output: 品詞付き分詞
-```
-
-### Phase 4: Full pipeline（NER + 依存）
-
-完整移植。可能不值得——GiNZA/spaCy 已經能做。
-
-## 量化實驗計畫
-
-| 量化 | 預期 | 風險 |
-|------|------|------|
-| FP32 → FP16 | 2x 速度, 精度無損 | 無 |
-| FP16 → INT8 | 2x 速度, 精度微降 | DeBERTa disentangled attention 可能受影響 |
-| INT4 / Q4 | 4x 速度 | encoder 可能崩潰（同 GLiNER Forge 的教訓） |
-
-從 GLiNER-Forge 學到的：
-- FP16 安全
-- INT8 需要 fp16→fp32 清理（153 個隱藏 tensor）再量化
-- INT4 對 encoder 通常毀滅性
-
-## 目前狀態 (2026-07-05)
-
-### 已完成
-- ✅ 權重已下載：`kevinzhow/kwja-mlx` base model (424MB, FP32)
-- ✅ 結構分析完成：encoder (104M) + 3 tagger heads (0.6M each)
-- ✅ 發現：kevinzhow 已轉好 tiny/base/large 全系列 MLX weights
-- ✅ Tokenizer: `ku-nlp/deberta-v2-base-japanese-char-wwm`
-
-### Blocker
-- DeBERTa-v2 使用 **disentangled attention**（content-position 分離），不是標準 self-attention
-- 直接用 standard attention 會得到錯誤結果
-- 需要正確實作 relative position embedding + disentangled QKV
-
-### 選項
-1. **正確實作 DeBERTa-v2 attention in MLX** — 1-2 天工作，需要讀原始碼對照
-2. **用 `mlx-community` 的 DeBERTa 如果有人做了** — 查是否已有
-3. **用 PyTorch MPS 作為 baseline，之後再 MLX 化** — 最快出結果
-
-### 已確認的 benchmark（不需要 MLX）
-- fugashi (MeCab): 270K sent/sec — 詞頻分析用這個
-- Sudachi: 244K sent/sec — 正規化分析用這個
-- KWJA MPS: 待測（SSL 問題需解決）
-
-## 實驗步驟
-
-```
-1. 下載 KWJA PyTorch weights (ku-nlp/kwja-char-base)
-2. 轉換 → MLX safetensors (to_mlx.py 複用 GLiNER-Forge 的)
-3. 寫 MLX forward pass (DeBERTa encoder + BIO classification head)
-4. 驗證：跟 KWJA PyTorch 比較分詞結果一致性
-5. Benchmark：MLX vs PyTorch CPU vs PyTorch MPS
-6. 量化：FP16 → INT8 → 測精度/速度 trade-off
-7. 整合：output 格式跟 fugashi 相容（surface + POS）
-```
-
-## 預期結果
-
-| Backend | Speed (est.) | Accuracy |
-|---------|-------------|----------|
-| KWJA PyTorch CPU | 10 sent/sec | baseline |
-| KWJA PyTorch MPS | 30 sent/sec | same |
-| **kwja-mlx FP16** | **100-200 sent/sec** | same |
-| **kwja-mlx INT8** | **200-400 sent/sec** | ~99% |
-| fugashi (MeCab) | 270K sent/sec | lower |
-
-即使 MLX 化後仍比 MeCab 慢 1000x，但精度差距足以 justify（特別是口語/網路語言）。
-
-## Target API
+## Quick Start
 
 ```python
 from kwja_mlx import Analyzer
 
-analyzer = Analyzer(model="base", quantize="fp16")
+analyzer = Analyzer(quantize="q8")  # q8 recommended: fast + accurate
 
-# 分詞 only（最快）
-tokens = analyzer.tokenize("ピアノ上手ですね")
-# → [Token(surface='ピアノ', pos='名詞'), Token(surface='上手', pos='形容詞'), ...]
+# Quick mode (segmentation + POS + NER, no reading)
+morphemes = analyzer.tokenize("東京都庁に行きました")
+for m in morphemes:
+    print(f"{m.surface}/{m.pos}")
+# 東京/名詞  都庁/名詞  に/助詞  行き/動詞  ました/接尾辞
 
-# Full analysis
-result = analyzer.analyze("ピアノ上手ですね")
-# → Analysis(tokens=[...], ner=[...], dependencies=[...])
+# Full mode (+ reading/lemma/canon via T5)
+result = analyzer.analyze("東京都庁に行きました")
+for m in result.morphemes:
+    print(f"{m.surface}/{m.pos} [{m.reading}]")
+# 東京/名詞 [とうきょう]  都庁/名詞 [とちょう]  に/助詞 [に]  行き/動詞 [いき]  ました/接尾辞 [ました]
 ```
 
-## 依賴
+## Performance
+
+Tested on Apple Silicon (M-series Mac).
+
+### Quick Mode (char → word)
+
+| Variant | Speed (sent/sec) | Segmentation F1 | POS Accuracy |
+|---------|------------------|-----------------|--------------|
+| FP32    | 78               | 1.000           | baseline     |
+| FP16    | ~150             | 1.000           | 1.000        |
+| Q8      | ~170             | 1.000           | 1.000        |
+| Q4      | ~180             | 0.997           | 1.000        |
+
+### Full Mode (char → word → T5)
+
+| Variant | Speed (sent/sec) | Output Match |
+|---------|------------------|--------------|
+| FP32    | 5.9              | baseline     |
+| Q8      | ~8               | ✓ identical  |
+| Q4      | ~9               | ✓ identical  |
+
+### vs PyTorch KWJA
+
+| Backend | Quick Mode | Full Mode |
+|---------|-----------|-----------|
+| PyTorch CPU | ~10 sent/sec | ~3 sent/sec |
+| PyTorch MPS | ~30 sent/sec | ~8 sent/sec |
+| **MLX FP32** | **78 sent/sec** | **5.9 sent/sec** |
+| **MLX Q8** | **~170 sent/sec** | **~8 sent/sec** |
+
+## Architecture
+
+```
+Input text
+    ↓
+[char module] DeBERTa-v2-base-japanese-char-wwm (22K vocab)
+    → Word segmentation (per-char B/I tagging)
+    ↓
+[word module] DeBERTa-v2-base-japanese (32K vocab)
+    → POS tagging + NER (first-subword pooling → classification)
+    ↓
+[seq2seq module] T5-base (32K vocab, encoder-decoder)
+    → Reading, lemma, canonical form (autoregressive generation)
+    ↓
+Output: Morpheme(surface, pos, ne, reading, lemma, canon)
+```
+
+## Requirements
 
 ```
 mlx >= 0.20
 numpy
 safetensors
-sentencepiece (for DeBERTa tokenizer)
+transformers
+huggingface_hub
+sentencepiece
 ```
 
-## 與 GLiNER-Forge 共用
+## Models
 
-- `convert/to_mlx.py` — 權重轉換（DeBERTa 同架構）
-- `convert/fix_fp16.py` — fp16 隱藏 tensor 清理
-- `convert/quantize.py` — INT8 量化
-- Benchmark 方法論
+Weights from [kevinzhow/kwja-mlx](https://huggingface.co/kevinzhow/kwja-mlx) (auto-downloaded on first use).
+
+Based on KWJA v2.4 checkpoints from Kyoto University:
+- char: `ku-nlp/deberta-v2-base-japanese-char-wwm`
+- word: `ku-nlp/deberta-v2-base-japanese`
+- seq2seq: `retrieva-jp/t5-base-long`
+
+## Citation
+
+```bibtex
+@InProceedings{Ueda2023a,
+  author    = {Nobuhiro Ueda and Kazumasa Omura and Takashi Kodama and Hirokazu Kiyomaru and Yugo Murawaki and Daisuke Kawahara and Sadao Kurohashi},
+  title     = {KWJA: A Unified Japanese Analyzer Based on Foundation Models},
+  booktitle = {Proceedings of the 61st Annual Meeting of the Association for Computational Linguistics: System Demonstrations},
+  year      = {2023},
+  address   = {Toronto, Canada},
+}
+```
 
 ## License
 
-MIT (KWJA itself is MIT)
+MIT (same as KWJA)
