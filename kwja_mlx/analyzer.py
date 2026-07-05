@@ -1,142 +1,345 @@
-"""KWJA MLX Analyzer — Japanese word segmentation using DeBERTa-v2 on Metal GPU."""
-
-import json
-import time
-from pathlib import Path
-from typing import Optional
+"""kwja-mlx: Full integrated Japanese analyzer (char → seq2seq → word)."""
 
 import mlx.core as mx
+import mlx.nn as nn
 import numpy as np
+import re
+from dataclasses import dataclass
+from typing import Optional
+from transformers import AutoTokenizer
+from safetensors.numpy import load_file
+from huggingface_hub import hf_hub_download
+
+from kwja_mlx.deberta_v2_mlx import DebertaV2Embeddings, DebertaV2Encoder
+from kwja_mlx.extensions import TwoLayerClassifier
+from kwja_mlx.t5_mlx import T5ForConditionalGeneration
+
+# KWJA label constants (from kwja.utils.constants)
+POS_TAGS = ['特殊', '動詞', '形容詞', '判定詞', '助動詞', '名詞', '指示詞', '副詞', '助詞', '接続詞', '連体詞', '感動詞', '接頭辞', '接尾辞']
+NE_TAGS = ['O', 'B-ORGANIZATION', 'I-ORGANIZATION', 'B-PERSON', 'I-PERSON', 'B-LOCATION', 'I-LOCATION',
+           'B-ARTIFACT', 'I-ARTIFACT', 'B-DATE', 'I-DATE', 'B-TIME', 'I-TIME', 'B-MONEY', 'I-MONEY',
+           'B-PERCENT', 'I-PERCENT']
+
+
+@dataclass
+class Morpheme:
+    surface: str
+    pos: str
+    ne: str = "O"
+    reading: Optional[str] = None
+    lemma: Optional[str] = None
+    canon: Optional[str] = None
+
+    def __repr__(self):
+        parts = [f"{self.surface}/{self.pos}"]
+        if self.ne != "O":
+            parts[0] += f"[{self.ne}]"
+        if self.reading:
+            parts.append(f"reading={self.reading}")
+        return f"Morpheme({', '.join(parts)})"
+
+
+@dataclass
+class AnalysisResult:
+    text: str
+    morphemes: list[Morpheme]
+
+    def to_text(self) -> str:
+        return " ".join(f"{m.surface}/{m.pos}" for m in self.morphemes)
+
+
+# Weight key mapping
+def _remap_deberta_key(k: str) -> str:
+    k = re.sub(r'^encoder\.embeddings\.', 'embeddings.', k)
+    k = re.sub(r'^encoder\.encoder\.layer\.', 'encoder.layer.', k)
+    k = re.sub(r'^encoder\.encoder\.rel_embeddings\.', 'encoder.rel_embeddings.', k)
+    k = re.sub(r'^encoder\.encoder\.LayerNorm\.', 'encoder.LayerNorm.', k)
+    k = re.sub(r'^encoder\.encoder\.conv\.', 'encoder.conv.', k)
+    k = k.replace('.attention.output.dense.', '.attention.out_proj.')
+    k = k.replace('.attention.output.LayerNorm.', '.ln1.')
+    k = k.replace('.output.LayerNorm.', '.ln2.')
+    k = k.replace('.intermediate.dense.', '.linear1.')
+    k = k.replace('.output.dense.', '.linear2.')
+    return k
+
+
+class ConvLayerMLX(nn.Module):
+    def __init__(self, hidden_size: int, kernel_size: int = 3):
+        super().__init__()
+        self.conv = nn.Conv1d(hidden_size, hidden_size, kernel_size, padding=kernel_size // 2)
+        self.LayerNorm = nn.LayerNorm(hidden_size)
+
+    def __call__(self, hidden_states, residual_states):
+        return self.LayerNorm(residual_states + nn.gelu(self.conv(hidden_states)))
+
+
+class DeBERTaWithConv(DebertaV2Encoder):
+    def __init__(self, config):
+        super().__init__(config)
+        self.conv = ConvLayerMLX(config['hidden_size'])
+
+    def __call__(self, h, **kw):
+        mask = self.get_attention_mask(mx.ones(h.shape[:2]))
+        rel_emb = self.get_rel_embedding()
+        out = h
+        embed = h
+        for i, layer in enumerate(self.layer):
+            out = layer(out, mask, query_states=out, relative_pos=None, rel_embeddings=rel_emb)
+            if i == 0:
+                out = self.conv(embed, out)
+        return out
+
+
+class CharModule(nn.Module):
+    """Character-level word segmentation."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.embeddings = DebertaV2Embeddings(config)
+        self.encoder = DeBERTaWithConv(config)
+        self.word_seg = TwoLayerClassifier(config['hidden_size'], 2)
+
+    def __call__(self, input_ids):
+        return self.word_seg(self.encoder(self.embeddings(input_ids)))
+
+
+class WordModule(nn.Module):
+    """Word-level POS tagging and NER."""
+
+    def __init__(self, config):
+        super().__init__()
+        self.embeddings = DebertaV2Embeddings(config)
+        self.encoder = DeBERTaWithConv(config)
+        self.pos_tagger = TwoLayerClassifier(config['hidden_size'], 14)
+        self.ne_tagger = TwoLayerClassifier(config['hidden_size'], 17)
+
+    def __call__(self, input_ids):
+        return self.encoder(self.embeddings(input_ids))
 
 
 class Analyzer:
-    """KWJA-compatible Japanese word segmenter running on MLX Metal GPU.
-    
-    Uses the DeBERTa-v2 char module from kevinzhow/kwja-mlx weights
-    with OpenMed's MLX DeBERTa-v2 implementation.
-    """
+    """Full KWJA-MLX pipeline: char → seq2seq → word."""
 
-    def __init__(self, model_size: str = "base", cache_dir: str = "models/cache", verbose: bool = True):
-        from huggingface_hub import hf_hub_download
-        from transformers import AutoTokenizer
-        from safetensors.numpy import load_file
-        from kwja_mlx.deberta_v2_mlx import DebertaV2ForTokenClassification
+    def __init__(self, model_size: str = "base", quantize: Optional[str] = None):
+        """
+        Args:
+            model_size: "base" (only size available in MLX currently)
+            quantize: None, "fp16", "q8", or "q4"
+        """
+        self.model_size = model_size
+        self.quantize_mode = quantize
+        self._load_models()
 
-        t0 = time.time()
+    def _load_models(self):
+        repo = "kevinzhow/kwja-mlx"
+        snapshot_base = f"{self.model_size}/"
 
-        # Download weights
-        config_path = hf_hub_download(
-            "kevinzhow/kwja-mlx",
-            f"{model_size}/char_deberta-v2-{model_size}-wwm.mlx.json",
-            cache_dir=cache_dir,
-        )
-        weights_path = hf_hub_download(
-            "kevinzhow/kwja-mlx",
-            f"{model_size}/char_deberta-v2-{model_size}-wwm.mlx.safetensors",
-            cache_dir=cache_dir,
-        )
-
-        # Load config
-        with open(config_path) as f:
-            self.config = json.load(f)
-
-        # Load tokenizer (char-level)
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.config["encoder_repo"],
-            do_word_tokenize=False,
-            additional_special_tokens=[" "],
-        )
-
-        # Load weights
-        weights_np = load_file(weights_path)
-        
-        # Detect model dimensions from weights
-        hidden_size = weights_np["encoder.embeddings.word_embeddings.weight"].shape[1]
-        vocab_size = weights_np["encoder.embeddings.word_embeddings.weight"].shape[0]
-        
-        # Count layers
-        num_layers = 0
-        for k in weights_np:
-            if k.startswith("encoder.encoder.layer."):
-                layer_num = int(k.split(".")[3])
-                num_layers = max(num_layers, layer_num + 1)
-        
-        if verbose:
-            print(f"KWJA MLX ({model_size}): hidden={hidden_size}, layers={num_layers}, vocab={vocab_size}")
-
-        # Build model config
-        model_config = {
-            "hidden_size": hidden_size,
-            "num_hidden_layers": num_layers,
-            "num_attention_heads": hidden_size // 64,  # standard head_dim=64
-            "intermediate_size": hidden_size * 4,
-            "vocab_size": vocab_size,
-            "max_position_embeddings": 512,
-            "relative_attention": True,
-            "position_buckets": 256,
-            "max_relative_positions": -1,
-            "num_labels": 2,  # B/I for word segmentation
+        # Char module
+        char_config = {
+            'hidden_size': 768, 'num_hidden_layers': 12, 'num_attention_heads': 12,
+            'intermediate_size': 3072, 'vocab_size': 22013, 'max_position_embeddings': 512,
+            'relative_attention': True, 'position_buckets': 256, 'max_relative_positions': -1,
+            'pos_att_type': ['p2c', 'c2p'], 'share_att_key': True,
+            'hidden_dropout_prob': 0.0, 'attention_probs_dropout_prob': 0.0,
+            'norm_rel_ebd': 'layer_norm', 'position_biased_input': False,
         }
-
-        # Build model
-        self.model = DebertaV2ForTokenClassification(model_config)
-
-        # Load weights into model
-        weight_list = [(k, mx.array(v)) for k, v in weights_np.items() 
-                       if "word_segmentation_tagger" in k or "encoder" in k]
-        self.model.load_weights(weight_list)
-        mx.eval(self.model.parameters())
-
-        if verbose:
-            total_params = sum(v.size for v in dict(self.model.parameters()).values())
-            print(f"  Loaded: {total_params/1e6:.0f}M params in {time.time()-t0:.1f}s")
-
-    def tokenize(self, text: str) -> list[str]:
-        """Segment Japanese text into words."""
-        # Encode text to char IDs
-        encoded = self.tokenizer(text, return_tensors="np", truncation=True, max_length=512)
-        input_ids = mx.array(encoded["input_ids"])
-
-        # Forward pass
-        logits = self.model(input_ids)  # (1, seq_len, 2)
-        mx.eval(logits)
-
-        # Decode: argmax → B(0)/I(1)
-        tags = np.array(mx.argmax(logits[0], axis=-1))
-
-        # Reconstruct words from char-level BIO tags
-        tokens = self.tokenizer.convert_ids_to_tokens(encoded["input_ids"][0])
-        words = []
-        current_word = ""
-
-        for i in range(1, len(tokens)):  # skip [CLS]
-            token = tokens[i]
-            if token in ("[SEP]", "[PAD]", "[CLS]"):
-                break
-            
-            # Get actual character
-            char = token
-            if not char or char == "[UNK]":
+        char_path = hf_hub_download(repo, f"{snapshot_base}char_deberta-v2-base-wwm.mlx.safetensors")
+        char_weights = load_file(char_path)
+        char_mapped = {}
+        for k, v in char_weights.items():
+            new_k = _remap_deberta_key(k)
+            new_k = new_k.replace('word_segmentation_tagger.layers.0.', 'word_seg.dense.')
+            new_k = new_k.replace('word_segmentation_tagger.layers.3.', 'word_seg.classifier.')
+            if 'sent_seg' in new_k or 'norm_op' in new_k:
                 continue
+            char_mapped[new_k] = v
+        self.char_model = CharModule(char_config)
+        self.char_model.load_weights([(k, mx.array(v)) for k, v in char_mapped.items()])
+        self.char_tok = AutoTokenizer.from_pretrained(
+            'ku-nlp/deberta-v2-base-japanese-char-wwm',
+            do_word_tokenize=False, additional_special_tokens=[' ']
+        )
 
-            tag = tags[i]
-            if tag == 0:  # B = word boundary
-                if current_word:
-                    words.append(current_word)
-                current_word = char
-            else:  # I = continue word
-                current_word += char
+        # Word module
+        word_config = {
+            'hidden_size': 768, 'num_hidden_layers': 12, 'num_attention_heads': 12,
+            'intermediate_size': 3072, 'vocab_size': 32008, 'max_position_embeddings': 512,
+            'relative_attention': True, 'position_buckets': 256, 'max_relative_positions': -1,
+            'pos_att_type': ['p2c', 'c2p'], 'share_att_key': True,
+            'hidden_dropout_prob': 0.0, 'attention_probs_dropout_prob': 0.0,
+            'norm_rel_ebd': 'layer_norm', 'position_biased_input': False,
+        }
+        word_path = hf_hub_download(repo, f"{snapshot_base}word_deberta-v2-base.mlx.safetensors")
+        word_weights = load_file(word_path)
+        skip_prefixes = ['reading', 'subpos', 'conjtype', 'conjform', 'word_feature',
+                         'base_phrase', 'cohesion', 'crf', 'dependency', 'discourse']
+        word_mapped = {}
+        for k, v in word_weights.items():
+            new_k = _remap_deberta_key(k)
+            new_k = new_k.replace('pos_tagger.layers.0.', 'pos_tagger.dense.')
+            new_k = new_k.replace('pos_tagger.layers.3.', 'pos_tagger.classifier.')
+            new_k = new_k.replace('ne_tagger.layers.0.', 'ne_tagger.dense.')
+            new_k = new_k.replace('ne_tagger.layers.3.', 'ne_tagger.classifier.')
+            if any(x in new_k for x in skip_prefixes):
+                continue
+            word_mapped[new_k] = v
+        self.word_model = WordModule(word_config)
+        self.word_model.load_weights([(k, mx.array(v)) for k, v in word_mapped.items()])
+        self.word_tok = AutoTokenizer.from_pretrained(
+            'ku-nlp/deberta-v2-base-japanese',
+            additional_special_tokens=['[著者]', '[読者]', '[不特定:人]', '[不特定:物]', '[NULL]', '[NA]', '[ROOT]', ' ']
+        )
 
-        if current_word:
-            words.append(current_word)
+        # Seq2seq module (T5)
+        t5_config = {
+            'hidden_size': 768, 'num_heads': 12, 'ff_size': 2048,
+            'num_encoder_layers': 12, 'num_decoder_layers': 12, 'vocab_size': 32100,
+        }
+        t5_path = hf_hub_download(repo, f"{snapshot_base}seq2seq_t5-base.mlx.safetensors")
+        t5_weights = load_file(t5_path)
+        self.seq2seq_model = T5ForConditionalGeneration(t5_config)
+        self.seq2seq_model.load_weights([(k, mx.array(v)) for k, v in t5_weights.items()])
+        self.seq2seq_tok = AutoTokenizer.from_pretrained('retrieva-jp/t5-base-long')
 
+        # Apply quantization
+        if self.quantize_mode:
+            self._apply_quantization()
+
+        mx.eval(self.char_model.parameters(), self.word_model.parameters(), self.seq2seq_model.parameters())
+
+    def _apply_quantization(self):
+        pred = lambda _, m: isinstance(m, nn.Linear)
+        if self.quantize_mode == "fp16":
+            for model in [self.char_model, self.word_model, self.seq2seq_model]:
+                params = dict(nn.utils.tree_map(
+                    lambda x: x.astype(mx.float16) if x.dtype == mx.float32 else x,
+                    model.parameters()
+                ))
+                model.update(params)
+        elif self.quantize_mode == "q8":
+            for model in [self.char_model, self.word_model, self.seq2seq_model]:
+                nn.quantize(model, bits=8, group_size=64, class_predicate=pred)
+        elif self.quantize_mode == "q4":
+            for model in [self.char_model, self.word_model, self.seq2seq_model]:
+                nn.quantize(model, bits=4, group_size=64, class_predicate=pred)
+
+    def segment(self, text: str) -> list[str]:
+        """Segment text into words using char module."""
+        enc = self.char_tok(text, return_tensors='np', truncation=True, max_length=512)
+        logits = self.char_model(mx.array(enc['input_ids']))
+        mx.eval(logits)
+        tags = np.array(mx.argmax(logits[0], axis=-1))
+        tokens = self.char_tok.convert_ids_to_tokens(enc['input_ids'][0])
+
+        words = []
+        cur = ''
+        for i in range(1, len(tokens)):
+            if tokens[i] in ('[SEP]', '[PAD]'):
+                break
+            if tags[i] == 0:  # B (begin new word)
+                if cur:
+                    words.append(cur)
+                cur = tokens[i]
+            else:  # I (inside word)
+                cur += tokens[i]
+        if cur:
+            words.append(cur)
         return words
 
-    def batch_tokenize(self, texts: list[str], batch_size: int = 32) -> list[list[str]]:
-        """Batch tokenize multiple texts."""
+    def tag(self, words: list[str]) -> list[tuple[str, str, str]]:
+        """POS tag and NER pre-segmented words. Returns [(word, pos, ne), ...]."""
+        enc = self.word_tok(words, is_split_into_words=True, return_tensors='np',
+                            truncation=True, max_length=256)
+        h = self.word_model(mx.array(enc['input_ids']))
+        mx.eval(h)
+
+        # First-subword pooling
+        word_ids = enc.word_ids(0)
+        first_idx = [None] * len(words)
+        for ti, wid in enumerate(word_ids):
+            if wid is not None and wid < len(words) and first_idx[wid] is None:
+                first_idx[wid] = ti
+        for i in range(len(words)):
+            if first_idx[i] is None:
+                first_idx[i] = 0
+
+        idx = mx.array(np.array(first_idx, dtype=np.int32))
+        pooled = h[0, idx][None, :, :]
+
+        pos_logits = self.word_model.pos_tagger(pooled)
+        ne_logits = self.word_model.ne_tagger(pooled)
+        mx.eval(pos_logits, ne_logits)
+
+        pos_preds = np.array(mx.argmax(pos_logits[0], axis=-1))
+        ne_preds = np.array(mx.argmax(ne_logits[0], axis=-1))
+
+        return [
+            (words[i], POS_TAGS[pos_preds[i]], NE_TAGS[ne_preds[i]])
+            for i in range(len(words))
+        ]
+
+    def read(self, words: list[str]) -> list[tuple[str, str, str, str]]:
+        """Get reading, lemma, canon for words using seq2seq T5.
+        Returns [(surface, reading, lemma, canon), ...]."""
+        # Format input: words joined by <extra_id_5>
+        src_text = '<extra_id_5>'.join(words)
+        tokens = [x for x in self.seq2seq_tok.tokenize(src_text) if x != '▁']
+        input_ids = self.seq2seq_tok.convert_tokens_to_ids(tokens) + [self.seq2seq_tok.eos_token_id]
+
+        input_mx = mx.array([input_ids])
+        attention_mask = mx.ones_like(input_mx)
+
+        generated = self.seq2seq_model.generate(
+            input_mx, attention_mask, max_length=len(input_ids) * 5,
+            eos_token_id=1, decoder_start_token_id=0,
+        )
+        decoded = self.seq2seq_tok.decode(generated[1:])
+
+        # Parse: <extra_id_0>surf<extra_id_1>reading<extra_id_2>lemma<extra_id_3>canon
         results = []
-        for i in range(0, len(texts), batch_size):
-            batch = texts[i:i+batch_size]
-            for text in batch:
-                results.append(self.tokenize(text))
+        morphemes = decoded.split('<extra_id_0>')[1:]
+        for m in morphemes:
+            try:
+                parts1 = m.split('<extra_id_1>')
+                surf = parts1[0]
+                parts2 = parts1[1].split('<extra_id_2>')
+                reading = parts2[0]
+                parts3 = parts2[1].split('<extra_id_3>')
+                lemma = parts3[0]
+                canon = parts3[1] if len(parts3) > 1 else ""
+                results.append((surf, reading, lemma, canon))
+            except (IndexError, KeyError):
+                results.append((m.split('<extra_id_')[0], '', '', ''))
         return results
+
+    def analyze(self, text: str, with_reading: bool = True) -> AnalysisResult:
+        """Full analysis pipeline: segmentation → POS/NER → reading/lemma."""
+        # Step 1: Segment
+        words = self.segment(text)
+
+        # Step 2: POS + NER
+        tagged = self.tag(words)
+
+        # Step 3: Reading/lemma (optional, slower due to autoregressive T5)
+        readings = None
+        if with_reading:
+            readings = self.read(words)
+
+        # Build result
+        morphemes = []
+        for i, (word, pos, ne) in enumerate(tagged):
+            m = Morpheme(surface=word, pos=pos, ne=ne)
+            if readings and i < len(readings):
+                _, reading, lemma, canon = readings[i]
+                m.reading = reading
+                m.lemma = lemma
+                m.canon = canon
+            morphemes.append(m)
+
+        return AnalysisResult(text=text, morphemes=morphemes)
+
+    def tokenize(self, text: str) -> list[Morpheme]:
+        """Quick segmentation + POS (no reading). Fastest mode."""
+        words = self.segment(text)
+        tagged = self.tag(words)
+        return [Morpheme(surface=w, pos=p, ne=n) for w, p, n in tagged]
