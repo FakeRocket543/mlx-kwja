@@ -290,6 +290,89 @@ class Analyzer:
             words.append(cur)
         return words
 
+    def segment_batch(self, texts: list[str], batch_size: int = 64) -> list[list[str]]:
+        """Batch word segmentation. Much faster than calling segment() in a loop.
+
+        Args:
+            texts: list of input strings
+            batch_size: number of sentences per batch
+
+        Returns:
+            list of word lists, one per input text
+        """
+        results = [[] for _ in range(len(texts))]
+
+        # Filter out empty strings, track original indices
+        valid = [(i, t) for i, t in enumerate(texts) if t and t.strip()]
+        if not valid:
+            return results
+
+        for batch_start in range(0, len(valid), batch_size):
+            batch = valid[batch_start:batch_start + batch_size]
+            batch_texts = [t for _, t in batch]
+            batch_indices = [i for i, _ in batch]
+
+            # Batch encode with padding
+            enc = self.char_tok(
+                batch_texts, return_tensors='np', truncation=True,
+                max_length=512, padding=True,
+            )
+            input_ids = mx.array(enc['input_ids'])  # (B, L)
+            logits = self.char_model(input_ids)  # (B, L, 2)
+            mx.eval(logits)
+            all_tags = np.array(mx.argmax(logits, axis=-1))  # (B, L)
+
+            # Decode each sentence in the batch
+            for j, (orig_idx, text) in enumerate(batch):
+                ids_j = enc['input_ids'][j]
+                tags_j = all_tags[j]
+                tokens_j = self.char_tok.convert_ids_to_tokens(ids_j)
+
+                words = []
+                cur = ''
+                for k in range(1, len(tokens_j)):
+                    if tokens_j[k] in ('[SEP]', '[PAD]'):
+                        break
+                    if tags_j[k] == 0:  # B (begin new word)
+                        if cur:
+                            words.append(cur)
+                        cur = tokens_j[k]
+                    else:  # I (inside word)
+                        cur += tokens_j[k]
+                if cur:
+                    words.append(cur)
+                results[orig_idx] = words
+
+        return results
+
+    def tokenize_batch(self, texts: list[str], batch_size: int = 64) -> list[list[Morpheme]]:
+        """Batch tokenization (segment + POS + NER). Much faster than loop.
+
+        Args:
+            texts: list of input strings
+            batch_size: number of sentences per batch
+
+        Returns:
+            list of Morpheme lists, one per input text
+        """
+        # Step 1: batch segmentation
+        all_words = self.segment_batch(texts, batch_size=batch_size)
+
+        # Step 2: batch POS + NER
+        results = [[] for _ in range(len(texts))]
+        valid = [(i, w) for i, w in enumerate(all_words) if w]
+        if not valid:
+            return results
+
+        for batch_start in range(0, len(valid), batch_size):
+            batch = valid[batch_start:batch_start + batch_size]
+
+            for orig_idx, words in batch:
+                tagged = self.tag(words)
+                results[orig_idx] = [Morpheme(surface=w, pos=p, ne=n) for w, p, n in tagged]
+
+        return results
+
     def tag(self, words: list[str]) -> list[tuple[str, str, str]]:
         """POS tag and NER pre-segmented words. Returns [(word, pos, ne), ...]."""
         if not words:
