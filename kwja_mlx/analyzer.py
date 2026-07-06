@@ -172,7 +172,7 @@ class Analyzer:
         word_path = hf_hub_download(repo, f"{snapshot_base}word_deberta-v2-base.mlx.safetensors")
         word_weights = load_file(word_path)
         skip_prefixes = ['reading', 'subpos', 'conjtype', 'conjform', 'word_feature',
-                         'base_phrase', 'cohesion', 'crf', 'dependency', 'discourse']
+                         'base_phrase', 'cohesion', 'dependency', 'discourse']
         word_mapped = {}
         for k, v in word_weights.items():
             new_k = _remap_deberta_key(k)
@@ -183,6 +183,15 @@ class Analyzer:
             if any(x in new_k for x in skip_prefixes):
                 continue
             word_mapped[new_k] = v
+
+        # Load CRF parameters as numpy arrays (small tensors, no need for MLX)
+        self.crf_start = word_weights['crf.start_transitions']   # (17,)
+        self.crf_end = word_weights['crf.end_transitions']       # (17,)
+        self.crf_trans = word_weights['crf.transitions']         # (17, 17)
+
+        # Remove CRF keys from MLX model loading (they're not part of the nn.Module)
+        word_mapped = {k: v for k, v in word_mapped.items() if not k.startswith('crf.')}
+
         self.word_model = WordModule(word_config)
         self.word_model.load_weights([(k, mx.array(v)) for k, v in word_mapped.items()])
         self.word_tok = AutoTokenizer.from_pretrained(
@@ -222,6 +231,39 @@ class Analyzer:
         elif self.quantize_mode == "q4":
             for model in [self.char_model, self.word_model, self.seq2seq_model]:
                 nn.quantize(model, bits=4, group_size=64, class_predicate=pred)
+
+    def _viterbi_decode(self, emissions: np.ndarray) -> list[int]:
+        """Viterbi decode NER tags with CRF transitions.
+
+        emissions: (seq_len, n_tags) numpy array of emission scores
+        Returns: list of tag indices (best path)
+        """
+        seq_len, n_tags = emissions.shape
+
+        # score[t] holds the best score arriving at each tag at time t
+        score = self.crf_start + emissions[0]  # (n_tags,)
+        # backpointers[t] stores the best previous tag for each current tag
+        backpointers = []
+
+        for t in range(1, seq_len):
+            # score_prev[:, None] + trans[i, j] = score of coming from tag i to tag j
+            # shape: (n_tags, n_tags) where [i, j] = score[i] + trans[i, j]
+            next_scores = score[:, None] + self.crf_trans  # (n_tags, n_tags)
+            best_prev = np.argmax(next_scores, axis=0)  # (n_tags,)
+            score = next_scores[best_prev, np.arange(n_tags)] + emissions[t]
+            backpointers.append(best_prev)
+
+        # Add end transitions
+        score += self.crf_end
+        best_last = int(np.argmax(score))
+
+        # Backtrack
+        best_path = [best_last]
+        for bp in reversed(backpointers):
+            best_path.append(int(bp[best_path[-1]]))
+        best_path.reverse()
+
+        return best_path
 
     def segment(self, text: str) -> list[str]:
         """Segment text into words using char module."""
@@ -271,7 +313,8 @@ class Analyzer:
         mx.eval(pos_logits, ne_logits)
 
         pos_preds = np.array(mx.argmax(pos_logits[0], axis=-1))
-        ne_preds = np.array(mx.argmax(ne_logits[0], axis=-1))
+        ne_emissions = np.array(ne_logits[0])
+        ne_preds = np.array(self._viterbi_decode(ne_emissions))
 
         return [
             (words[i], POS_TAGS[pos_preds[i]], NE_TAGS[ne_preds[i]])
