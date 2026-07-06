@@ -267,6 +267,8 @@ class Analyzer:
 
     def segment(self, text: str) -> list[str]:
         """Segment text into words using char module."""
+        if not text or not text.strip():
+            return []
         enc = self.char_tok(text, return_tensors='np', truncation=True, max_length=512)
         logits = self.char_model(mx.array(enc['input_ids']))
         mx.eval(logits)
@@ -290,6 +292,8 @@ class Analyzer:
 
     def tag(self, words: list[str]) -> list[tuple[str, str, str]]:
         """POS tag and NER pre-segmented words. Returns [(word, pos, ne), ...]."""
+        if not words:
+            return []
         enc = self.word_tok(words, is_split_into_words=True, return_tensors='np',
                             truncation=True, max_length=256)
         h = self.word_model(mx.array(enc['input_ids']))
@@ -357,6 +361,9 @@ class Analyzer:
 
     def analyze(self, text: str, with_reading: bool = True) -> AnalysisResult:
         """Full analysis pipeline: segmentation → POS/NER → reading/lemma."""
+        if not text or not text.strip():
+            return AnalysisResult(text=text or "", morphemes=[])
+
         # Step 1: Segment
         words = self.segment(text)
 
@@ -383,6 +390,8 @@ class Analyzer:
 
     def tokenize(self, text: str) -> list[Morpheme]:
         """Quick segmentation + POS (no reading). Fastest mode."""
+        if not text or not text.strip():
+            return []
         words = self.segment(text)
         tagged = self.tag(words)
         return [Morpheme(surface=w, pos=p, ne=n) for w, p, n in tagged]
