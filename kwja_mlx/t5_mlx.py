@@ -285,7 +285,7 @@ class T5ForConditionalGeneration(nn.Module):
         max_length: int = 256,
         eos_token_id: int = 1,
         decoder_start_token_id: int = 0,
-    ) -> mx.array:
+    ) -> list[int]:
         """Greedy decoding."""
         encoder_output = self.encode(input_ids, attention_mask)
         mx.eval(encoder_output)

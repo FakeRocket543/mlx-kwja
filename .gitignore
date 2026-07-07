@@ -1,2 +1,6 @@
-__pycache__/\n*.pyc\nmodels/
+__pycache__/
+*.pyc
+*.egg-info/
+build/
+dist/
 models/

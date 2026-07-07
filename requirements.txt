@@ -3,4 +3,4 @@ numpy
 safetensors
 sentencepiece
 transformers>=4.40
-torch
+huggingface-hub>=0.20

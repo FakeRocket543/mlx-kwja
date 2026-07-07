@@ -1,4 +1,4 @@
-"""kwja-mlx: Full integrated Japanese analyzer (char → seq2seq → word)."""
+"""kwja-mlx: Full integrated Japanese analyzer (char → word → seq2seq)."""
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -310,7 +310,6 @@ class Analyzer:
         for batch_start in range(0, len(valid), batch_size):
             batch = valid[batch_start:batch_start + batch_size]
             batch_texts = [t for _, t in batch]
-            batch_indices = [i for i, _ in batch]
 
             # Batch encode with padding
             enc = self.char_tok(

@@ -1,3 +1,5 @@
+> **Note (2026-07-07):** CRF Viterbi decoding has been implemented in `analyzer.py`. This document is historical debug notes from the initial port.
+
 # Word Module — FIXED ✅
 
 ## Root Cause
