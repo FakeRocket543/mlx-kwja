@@ -130,7 +130,7 @@ class Analyzer:
         self.quantize_mode = quantize
         self._load_models()
 
-    def _load_models(self):
+    def _load_models(self) -> None:
         repo = "kevinzhow/kwja-mlx"
         snapshot_base = f"{self.model_size}/"
 
@@ -216,8 +216,10 @@ class Analyzer:
 
         mx.eval(self.char_model.parameters(), self.word_model.parameters(), self.seq2seq_model.parameters())
 
-    def _apply_quantization(self):
-        pred = lambda _, m: isinstance(m, nn.Linear)
+    def _apply_quantization(self) -> None:
+        def _is_linear(_, m):
+            return isinstance(m, nn.Linear)
+
         if self.quantize_mode == "fp16":
             for model in [self.char_model, self.word_model, self.seq2seq_model]:
                 params = dict(nn.utils.tree_map(
@@ -227,10 +229,10 @@ class Analyzer:
                 model.update(params)
         elif self.quantize_mode == "q8":
             for model in [self.char_model, self.word_model, self.seq2seq_model]:
-                nn.quantize(model, bits=8, group_size=64, class_predicate=pred)
+                nn.quantize(model, bits=8, group_size=64, class_predicate=_is_linear)
         elif self.quantize_mode == "q4":
             for model in [self.char_model, self.word_model, self.seq2seq_model]:
-                nn.quantize(model, bits=4, group_size=64, class_predicate=pred)
+                nn.quantize(model, bits=4, group_size=64, class_predicate=_is_linear)
 
     def _viterbi_decode(self, emissions: np.ndarray) -> list[int]:
         """Viterbi decode NER tags with CRF transitions.
@@ -357,20 +359,83 @@ class Analyzer:
         # Step 1: batch segmentation
         all_words = self.segment_batch(texts, batch_size=batch_size)
 
-        # Step 2: batch POS + NER
-        results = [[] for _ in range(len(texts))]
+        # Step 2: batch POS + NER using true batched DeBERTa inference
         valid = [(i, w) for i, w in enumerate(all_words) if w]
         if not valid:
-            return results
+            return [[] for _ in range(len(texts))]
 
-        for batch_start in range(0, len(valid), batch_size):
-            batch = valid[batch_start:batch_start + batch_size]
+        indices = [i for i, _ in valid]
+        word_lists = [w for _, w in valid]
+        tagged_all = self.tag_batch(word_lists, batch_size=batch_size)
 
-            for orig_idx, words in batch:
-                tagged = self.tag(words)
-                results[orig_idx] = [Morpheme(surface=w, pos=p, ne=n) for w, p, n in tagged]
+        results = [[] for _ in range(len(texts))]
+        for orig_idx, tagged in zip(indices, tagged_all):
+            results[orig_idx] = [Morpheme(surface=w, pos=p, ne=n) for w, p, n in tagged]
 
         return results
+
+    def tag_batch(self, word_lists: list[list[str]], batch_size: int = 32) -> list[list[tuple[str, str, str]]]:
+        """Batch POS tag and NER for multiple pre-segmented sentences.
+
+        Batches the DeBERTa word model forward pass by padding inputs.
+        CRF Viterbi decoding remains per-sentence (fast, O(L×K²)).
+
+        Args:
+            word_lists: list of word lists (each is a pre-segmented sentence)
+            batch_size: number of sentences per DeBERTa forward pass
+
+        Returns:
+            list of [(word, pos, ne), ...] for each sentence
+        """
+        all_results: list[list[tuple[str, str, str]]] = []
+
+        for batch_start in range(0, len(word_lists), batch_size):
+            batch_words = word_lists[batch_start:batch_start + batch_size]
+
+            # Batch tokenize all sentences in this batch
+            enc = self.word_tok(
+                batch_words,
+                is_split_into_words=True,
+                padding=True,
+                truncation=True,
+                max_length=256,
+                return_tensors='np',
+            )
+
+            # Run DeBERTa on the full batch: (B, L) -> (B, L, H)
+            input_ids = mx.array(enc['input_ids'])
+            h = self.word_model(input_ids)
+            mx.eval(h)
+
+            # Per-sentence: first-subword pooling, POS argmax, NER Viterbi
+            for j, words in enumerate(batch_words):
+                n_words = len(words)
+
+                # First-subword pooling using word_ids
+                word_ids = enc.word_ids(j)
+                first_idx: list[int] = [0] * n_words
+                for ti, wid in enumerate(word_ids):
+                    if wid is not None and wid < n_words and first_idx[wid] == 0:
+                        first_idx[wid] = ti
+
+                idx = mx.array(np.array(first_idx, dtype=np.int32))
+                pooled = h[j, idx][None, :, :]  # (1, n_words, H)
+
+                pos_logits = self.word_model.pos_tagger(pooled)
+                ne_logits = self.word_model.ne_tagger(pooled)
+                mx.eval(pos_logits, ne_logits)
+
+                pos_preds = np.array(mx.argmax(pos_logits[0], axis=-1))
+                ne_emissions = np.array(ne_logits[0])
+                ne_preds = np.array(self._viterbi_decode(ne_emissions))
+
+                tagged = [
+                    (words[i], POS_TAGS[pos_preds[i]], NE_TAGS[ne_preds[i]])
+                    for i in range(n_words)
+                ]
+                all_results.append(tagged)
+
+        return all_results
 
     def tag(self, words: list[str]) -> list[tuple[str, str, str]]:
         """POS tag and NER pre-segmented words. Returns [(word, pos, ne), ...]."""
@@ -383,13 +448,10 @@ class Analyzer:
 
         # First-subword pooling
         word_ids = enc.word_ids(0)
-        first_idx = [None] * len(words)
+        first_idx: list[int] = [0] * len(words)
         for ti, wid in enumerate(word_ids):
-            if wid is not None and wid < len(words) and first_idx[wid] is None:
+            if wid is not None and wid < len(words) and first_idx[wid] == 0:
                 first_idx[wid] = ti
-        for i in range(len(words)):
-            if first_idx[i] is None:
-                first_idx[i] = 0
 
         idx = mx.array(np.array(first_idx, dtype=np.int32))
         pooled = h[0, idx][None, :, :]
