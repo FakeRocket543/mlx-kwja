@@ -112,6 +112,26 @@ Based on KWJA v2.4 checkpoints from Kyoto University:
 - word: `ku-nlp/deberta-v2-base-japanese`
 - seq2seq: `retrieva-jp/t5-base-long`
 
+### Reproducing the weights (no trust-me binaries)
+
+`scripts/convert_kwja_to_mlx.py` rebuilds the `.mlx.safetensors` artifacts
+from the official Kyoto `.ckpt` files — verified **byte-identical** to
+kevinzhow/kwja-mlx (char 214/214, word 264/264, seq2seq 282/282 tensors,
+2026-10-13):
+
+```bash
+python scripts/convert_kwja_to_mlx.py --model-size base --module all --out ./converted
+```
+
+Needs `torch` + `safetensors` (CPU is fine). Conversion is key-rename only,
+plus one transpose: char conv `(O,I,K)` → `(O,K,I)`.
+
+## Attribution
+
+- Upstream analyzer: [ku-nlp/kwja](https://github.com/ku-nlp/kwja) (MIT) — label tables, decode logic, model design.
+- Converted weights: [kevinzhow/kwja-mlx](https://huggingface.co/kevinzhow/kwja-mlx) — independently reproducible via `scripts/convert_kwja_to_mlx.py`.
+- DeBERTa-v2 MLX backbone borrows layout ideas from `openmed.mlx.convert`.
+
 ## Citation
 
 ```bibtex
