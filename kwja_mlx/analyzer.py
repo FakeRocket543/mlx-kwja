@@ -1,14 +1,15 @@
 """kwja-mlx: Full integrated Japanese analyzer (char → word → seq2seq)."""
 
-import mlx.core as mx
-import mlx.nn as nn
-import numpy as np
 import re
 from dataclasses import dataclass
 from typing import Optional
-from transformers import AutoTokenizer
-from safetensors.numpy import load_file
+
+import mlx.core as mx
+from mlx import nn
+import numpy as np
 from huggingface_hub import hf_hub_download
+from safetensors.numpy import load_file
+from transformers import AutoTokenizer
 
 from kwja_mlx.deberta_v2_mlx import DebertaV2Embeddings, DebertaV2Encoder
 from kwja_mlx.extensions import TwoLayerClassifier
@@ -118,7 +119,7 @@ class WordModule(nn.Module):
 
 
 class Analyzer:
-    """Full KWJA-MLX pipeline: char → seq2seq → word."""
+    """Full KWJA-MLX pipeline: char → word → seq2seq."""
 
     def __init__(self, model_size: str = "base", quantize: Optional[str] = None):
         """
@@ -472,7 +473,8 @@ class Analyzer:
     def read(self, words: list[str]) -> list[tuple[str, str, str, str]]:
         """Get reading, lemma, canon for words using seq2seq T5.
         Returns [(surface, reading, lemma, canon), ...]."""
-        # Format input: words joined by <extra_id_5>
+        # Morphemes joined by <extra_id_5> sentinel; drop stray word-boundary
+        # markers (▁) so joins stay glued when retokenized by SentencePiece.
         src_text = '<extra_id_5>'.join(words)
         tokens = [x for x in self.seq2seq_tok.tokenize(src_text) if x != '▁']
         input_ids = self.seq2seq_tok.convert_tokens_to_ids(tokens) + [self.seq2seq_tok.eos_token_id]

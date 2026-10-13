@@ -21,7 +21,7 @@ from typing import Optional
 
 try:
     import mlx.core as mx
-    import mlx.nn as nn
+    from mlx import nn
 except ImportError:
     raise ImportError(
         "MLX is required for this module. Install with: pip install openmed[mlx]"

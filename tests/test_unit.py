@@ -1,6 +1,6 @@
 """Unit tests for kwja-mlx (no model weights required for most tests)."""
-import pytest
 import numpy as np
+import pytest
 
 
 class TestViterbiDecode:
@@ -67,7 +67,7 @@ class TestMorpheme:
 
 class TestAnalysisResult:
     def test_to_text(self):
-        from kwja_mlx.analyzer import Morpheme, AnalysisResult
+        from kwja_mlx.analyzer import AnalysisResult, Morpheme
         morphemes = [
             Morpheme(surface='東京', pos='名詞'),
             Morpheme(surface='に', pos='助詞'),

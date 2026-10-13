@@ -135,7 +135,7 @@ def test_precision(quantize_mode):
     results = {}
 
     # --- Segmentation test ---
-    print(f"\n  [1] Word Segmentation")
+    print("\n  [1] Word Segmentation")
     seg_results = {}
     for sent in TEST_SENTENCES[:5]:
         words = a.segment(sent)
@@ -147,7 +147,7 @@ def test_precision(quantize_mode):
     results['segment_speed'] = seg_speed
 
     # --- Tokenize test (POS + NER, no reading) ---
-    print(f"\n  [2] POS + NER (tokenize)")
+    print("\n  [2] POS + NER (tokenize)")
     all_bio_errors = []
     all_entities = {}
     for sent in TEST_SENTENCES:
@@ -168,7 +168,7 @@ def test_precision(quantize_mode):
         for e in all_bio_errors[:5]:
             print(f"        {e}")
     else:
-        print(f"      ✅ All B/I sequences valid")
+        print("      ✅ All B/I sequences valid")
 
     tok_speed = run_throughput_test(a, TEST_SENTENCES, mode="tokenize")
     print(f"      Throughput: {tok_speed:.0f} sent/sec")
@@ -176,7 +176,7 @@ def test_precision(quantize_mode):
     results['bio_errors'] = len(all_bio_errors)
 
     # --- NER accuracy check ---
-    print(f"\n  [3] NER Entity Validation")
+    print("\n  [3] NER Entity Validation")
     ner_hits = 0
     ner_total = 0
     for sent, expected in EXPECTED_NER.items():
@@ -199,7 +199,7 @@ def test_precision(quantize_mode):
     results['ner_recall'] = ner_recall
 
     # --- Full analysis test (with T5 reading) ---
-    print(f"\n  [4] Full Analysis (with reading/lemma)")
+    print("\n  [4] Full Analysis (with reading/lemma)")
     test_sents_short = TEST_SENTENCES[:4]  # T5 is slow, limit
     for sent in test_sents_short[:2]:
         result = a.analyze(sent, with_reading=True)
@@ -215,7 +215,7 @@ def test_precision(quantize_mode):
     results['analyze_speed'] = analyze_speed
 
     # --- Bulk throughput (525 sentences from Wikipedia) ---
-    print(f"\n  [5] Bulk Throughput (Wikipedia full article)")
+    print("\n  [5] Bulk Throughput (Wikipedia full article)")
     wiki_sents_path = Path("/tmp/wiki_japan_sents.txt")
     if wiki_sents_path.exists():
         wiki_sents = [line.strip() for line in wiki_sents_path.read_text().splitlines() if line.strip()]
@@ -244,14 +244,14 @@ def main():
     for q in precisions:
         try:
             all_results[q or "fp32"] = test_precision(q)
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 — benchmark harness: report per-precision failure, keep going
             print(f"  ❌ Failed for {q or 'fp32'}: {e}")
             import traceback
             traceback.print_exc()
 
     # --- Summary table ---
     print(f"\n{'='*60}")
-    print(f"  SUMMARY")
+    print("  SUMMARY")
     print(f"{'='*60}")
     print(f"  {'Mode':<6} | {'Segment':>8} | {'Tokenize':>9} | {'Analyze':>8} | {'Bulk':>6} | {'BIO err':>7} | {'NER':>5}")
     print(f"  {'':<6} | {'sent/s':>8} | {'sent/s':>9} | {'sent/s':>8} | {'s/s':>6} | {'':>7} | {'recall':>5}")

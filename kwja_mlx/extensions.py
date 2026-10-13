@@ -1,11 +1,10 @@
 """KWJA-specific extensions to OpenMed's DeBERTa-v2 MLX implementation.
 
-Adds:
-1. ConvLayer (1D conv for local context mixing after embeddings)
-2. Two-layer classifier head (matching KWJA's tagger structure)
+Two-layer classifier head (matching KWJA's tagger structure).
+NOTE: the conv layer lives in analyzer.ConvLayerMLX (gelu), not here.
 """
 
-import mlx.nn as nn
+from mlx import nn
 
 
 class TwoLayerClassifier(nn.Module):

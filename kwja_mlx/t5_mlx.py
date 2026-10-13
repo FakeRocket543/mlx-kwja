@@ -1,9 +1,10 @@
 """T5 encoder-decoder implementation in MLX for KWJA seq2seq module."""
 
-import mlx.core as mx
-import mlx.nn as nn
-import numpy as np
 from typing import Optional
+
+import mlx.core as mx
+from mlx import nn
+import numpy as np
 
 
 class T5RelativePositionBias(nn.Module):
