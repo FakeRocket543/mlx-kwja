@@ -841,6 +841,74 @@ class Analyzer:
             pooled, len(words), discourse_threshold=discourse_threshold,
         )
 
+    def analyze_document(
+        self, texts: list[str], with_reading: bool = False,
+        discourse_threshold: float = 0.0,
+    ) -> list[AnalysisResult]:
+        """Document-level analysis: lexical per sentence, cohesion over a merged window.
+
+        All sentences' words share one encoder pass for the cohesion/discourse
+        heads, so PAS/BR/coref antecedents may resolve across sentence
+        boundaries (endophora index = flat morpheme offset across the document).
+        Falls back to per-sentence analyze() when only one non-empty text.
+        Long inputs are truncated to fit 256 tokens (stride windowing TODO).
+        """
+        results: list[AnalysisResult] = [
+            AnalysisResult(text=t, morphemes=[]) for t in texts
+        ]
+        valid_pos = [i for i, t in enumerate(texts) if t and t.strip()]
+        if not valid_pos:
+            return results
+        if len(valid_pos) == 1:
+            results[valid_pos[0]] = self.analyze(
+                texts[valid_pos[0]], with_reading=with_reading,
+            )
+            return results
+
+        # Lexical per sentence (segment + tag, no cohesion yet)
+        valid_texts = [texts[i] for i in valid_pos]
+        all_words = self.segment_batch(valid_texts)
+        tagged_all = self.tag_batch(all_words)
+        # Merge into one cohesion window: flat word list + sentence offsets
+        flat_words: list[str] = []
+        offsets: list[int] = []
+        for words in all_words:
+            offsets.append(len(flat_words))
+            flat_words.extend(words)
+        if flat_words:
+            cohesion_rels, discourse = self.analyze_cohesion(
+                flat_words, discourse_threshold=discourse_threshold,
+            )
+        else:
+            cohesion_rels, discourse = [], []
+
+        # Optional readings per sentence (T5 is per-sentence autoregressive)
+        readings_all = [self.read(w) if with_reading and w else None for w in all_words]
+        for vi, (words, tagged, readings) in enumerate(zip(all_words, tagged_all, readings_all)):
+            morphemes = []
+            for j, (word, pos, ne, subpos, conjtype, conjform, reading_cls, word_features, base_phrase_features) in enumerate(tagged):
+                m = Morpheme(
+                    surface=word, pos=pos, ne=ne,
+                    subpos=subpos, conjtype=conjtype, conjform=conjform,
+                    reading_cls=reading_cls, word_features=word_features,
+                    base_phrase_features=base_phrase_features,
+                )
+                if readings and j < len(readings):
+                    _, reading, lemma, canon = readings[j]
+                    m.reading = reading
+                    m.lemma = lemma
+                    m.canon = canon
+                flat_j = offsets[vi] + j
+                if flat_j < len(cohesion_rels):
+                    m.cohesion = cohesion_rels[flat_j]
+                morphemes.append(m)
+            add_dependency(self.word_model, morphemes, self.word_tok)
+            results[valid_pos[vi]] = AnalysisResult(text=valid_texts[vi], morphemes=morphemes)
+        # Discourse is document-level; attach to the last non-empty result
+        if discourse:
+            results[valid_pos[-1]].discourse = discourse
+        return results
+
     def read(self, words: list[str]) -> list[tuple[str, str, str, str]]:
         """Get reading, lemma, canon for words using seq2seq T5.
         Returns [(surface, reading, lemma, canon), ...]."""
