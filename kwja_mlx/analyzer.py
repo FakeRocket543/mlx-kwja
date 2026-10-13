@@ -1,7 +1,7 @@
 """kwja-mlx: Full integrated Japanese analyzer (char → word → seq2seq)."""
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import mlx.core as mx
@@ -11,7 +11,39 @@ from mlx import nn
 from safetensors.numpy import load_file
 from transformers import AutoTokenizer
 
-from kwja_mlx.deberta_v2_mlx import DebertaV2Embeddings, DebertaV2Encoder
+from kwja_mlx.cohesion import (
+    LoRARelationWiseWordSelectionHead,
+    WordSelectionHead,
+    analyze_heads,
+)
+from kwja_mlx.constants import (
+    CHOON_SET,
+    COHESION_RELATIONS,
+    CONJFORM_TAGS,
+    CONJTYPE_TAG_CONJFORM_TAG2CONJFORM_ID,
+    CONJTYPE_TAGS,
+    DISCOURSE_RELATIONS,
+    HATSUON_SET,
+    INFLECTABLE,
+    LOWER2UPPER,
+    POS_TAG_SUBPOS_TAG2SUBPOS_ID,
+    PROLONGED_MAP,
+    PROLONGED_MAP_FOR_EROW,
+    SENT_SEGMENTATION_TAGS,
+    SPECIALS,
+    SUBPOS_TAGS,
+    VOICED2VOICELESS,
+    WORD_FEATURES,
+    WORD_NORM_OP_TAGS,
+    WORD_SEGMENTATION_TAGS,
+    get_reading2reading_id,
+)
+from kwja_mlx.deberta_v2_mlx import (
+    DebertaV2Embeddings,
+    DebertaV2Encoder,
+    build_relative_position,
+)
+from kwja_mlx.dependency import DependencyHead, add_dependency
 from kwja_mlx.extensions import TwoLayerClassifier
 from kwja_mlx.t5_mlx import T5ForConditionalGeneration
 
@@ -30,6 +62,15 @@ class Morpheme:
     reading: Optional[str] = None
     lemma: Optional[str] = None
     canon: Optional[str] = None
+    subpos: str = "*"
+    conjtype: str = "*"
+    conjform: str = "*"
+    reading_cls: Optional[str] = None
+    word_features: tuple[str, ...] = ()
+    # {relation: antecedent morpheme index (endophora) | exophora referent str}
+    cohesion: dict = field(default_factory=dict)
+    parent_index: Optional[int] = None  # parent base-phrase index (-1 = root)
+    dep_type: Optional[str] = None  # 'D' / 'P' / 'A' / 'I'
 
     def __repr__(self):
         parts = [f"{self.surface}/{self.pos}"]
@@ -44,6 +85,8 @@ class Morpheme:
 class AnalysisResult:
     text: str
     morphemes: list[Morpheme]
+    # [{modifier, head, relation, score}] decoded between morpheme pairs
+    discourse: list = field(default_factory=list)
 
     def to_text(self) -> str:
         return " ".join(f"{m.surface}/{m.pos}" for m in self.morphemes)
@@ -64,6 +107,102 @@ def _remap_deberta_key(k: str) -> str:
     return k
 
 
+def _remap_char_key(k: str) -> str:
+    """Map a char-module checkpoint key to the MLX CharModule parameter path."""
+    k = _remap_deberta_key(k)
+    for src, dst in (
+        ('word_segmentation_tagger.layers.0.', 'word_seg.dense.'),
+        ('word_segmentation_tagger.layers.3.', 'word_seg.classifier.'),
+        ('sent_segmentation_tagger.layers.0.', 'sent_seg.dense.'),
+        ('sent_segmentation_tagger.layers.3.', 'sent_seg.classifier.'),
+        ('word_norm_op_tagger.layers.0.', 'norm_op.dense.'),
+        ('word_norm_op_tagger.layers.3.', 'norm_op.classifier.'),
+    ):
+        k = k.replace(src, dst)
+    return k
+
+
+def get_normalized_surf(surf: str, word_norm_op_tags: list[str], strict: bool = False) -> str:
+    """Rebuild a normalized surface from chars and their per-char norm op tags.
+
+    Port of kwja.utils.word_normalization.get_normalized_surf. K=keep, D=delete,
+    V=devoice (word-initial kana only in strict mode), S=small kana -> regular,
+    P/E=prolonged sign "ー" -> long vowel of the preceding kana (E uses the
+    e-row map). In non-strict mode an inapplicable op keeps the original char
+    instead of raising.
+    """
+    assert len(surf) == len(word_norm_op_tags)
+    norm = ''
+    for i, (c, op) in enumerate(zip(surf, word_norm_op_tags)):
+        if op == 'K':
+            norm += c
+        elif op == 'V':
+            if strict and i != 0:
+                raise ValueError(f'not an initial kana {c} in {surf}')
+            norm += VOICED2VOICELESS.get(c, c)
+        elif op == 'D':
+            if strict and c not in CHOON_SET and c not in HATSUON_SET and c not in LOWER2UPPER:
+                raise ValueError(f'not a removable kana {c} in {surf}')
+        elif op == 'S':
+            if c in LOWER2UPPER:
+                norm += LOWER2UPPER[c]
+            else:
+                if strict:
+                    raise ValueError(f'not a small kana {c} in {surf}')
+                norm += c
+        elif op in ('P', 'E'):
+            table = PROLONGED_MAP if op == 'P' else PROLONGED_MAP_FOR_EROW
+            if len(norm) == 0:
+                if strict:
+                    raise ValueError(f'no preceding kana for {c} in {surf}')
+                norm += c
+            elif c not in CHOON_SET:
+                if strict:
+                    raise ValueError(f'not a prolonged sign for {c} in {surf}')
+                norm += c
+            elif norm[-1] in table:
+                norm += table[norm[-1]]
+            else:
+                if strict:
+                    raise ValueError(f'not a valid preceding kana {norm[-1]} in {surf}')
+                norm += c
+        else:
+            raise NotImplementedError(f'unknown word norm op tag {op}')
+    return norm
+
+
+def _special_token_ids(tok) -> set[int]:
+    """Token ids whose positions are skipped when decoding char-module outputs:
+    bos/eos/sep/pad/cls/mask plus the extra word-boundary ' ' token. [UNK] is
+    real text and stays (mirrors upstream CharModuleWriter)."""
+    ids = {getattr(tok, f'{prefix}_token_id') for prefix in ('bos', 'eos', 'sep', 'pad', 'cls', 'mask')}
+    ids.discard(None)
+    space_id = tok.convert_tokens_to_ids(' ')
+    if space_id is not None:
+        ids.add(space_id)
+    return ids
+
+
+def _decode_sentences(tokens: list[str], tags, input_ids: list[int], special_ids: set) -> list[list[str]]:
+    """Group char tokens into sentences from per-char B/I tags (0 = B).
+
+    A B at a non-empty buffer starts a new sentence (upstream set_sentences);
+    positions whose *token id* is in special_ids are skipped.
+    """
+    sentences: list[list[str]] = []
+    cur: list[str] = []
+    for i, tok in enumerate(tokens):
+        if input_ids[i] in special_ids:
+            continue
+        if tags[i] == 0 and cur:
+            sentences.append(cur)
+            cur = []
+        cur.append(tok)
+    if cur:
+        sentences.append(cur)
+    return sentences
+
+
 class ConvLayerMLX(nn.Module):
     def __init__(self, hidden_size: int, kernel_size: int = 3):
         super().__init__()
@@ -79,29 +218,48 @@ class DeBERTaWithConv(DebertaV2Encoder):
         super().__init__(config)
         self.conv = ConvLayerMLX(config['hidden_size'])
 
-    def __call__(self, h, **kw):
+    def __call__(self, h, special_token_indices=None):
         mask = self.get_attention_mask(mx.ones(h.shape[:2]))
         rel_emb = self.get_rel_embedding()
+        rel_pos = None
+        if special_token_indices is not None and self.relative_attention:
+            # kwja deberta_v2.get_rel_pos: rows/cols of special tokens share one
+            # reserved relative-position bucket (-position_buckets), which after
+            # the +position_buckets embedding shift resolves to bucket 0.
+            length = h.shape[1]
+            rel_pos = build_relative_position(
+                h, h, bucket_size=self.position_buckets, max_position=self.max_relative_positions,
+            )
+            idx = mx.array(np.array(special_token_indices, dtype=np.int32))
+            special_mask = mx.zeros((1, length, length), dtype=mx.bool_)
+            special_mask[:, idx, :] = True
+            special_mask[:, :, idx] = True
+            special_pos = mx.full((1, length, length), -self.position_buckets, dtype=rel_pos.dtype)
+            rel_pos = mx.where(special_mask, special_pos, rel_pos)
         out = h
         embed = h
         for i, layer in enumerate(self.layer):
-            out = layer(out, mask, query_states=out, relative_pos=None, rel_embeddings=rel_emb)
+            out = layer(out, mask, query_states=out, relative_pos=rel_pos, rel_embeddings=rel_emb)
             if i == 0:
                 out = self.conv(embed, out)
         return out
 
 
 class CharModule(nn.Module):
-    """Character-level word segmentation."""
+    """Char-level modules: word segmentation / sentence segmentation / word norm ops."""
 
     def __init__(self, config):
         super().__init__()
         self.embeddings = DebertaV2Embeddings(config)
         self.encoder = DeBERTaWithConv(config)
-        self.word_seg = TwoLayerClassifier(config['hidden_size'], 2)
+        self.word_seg = TwoLayerClassifier(config['hidden_size'], len(WORD_SEGMENTATION_TAGS))
+        self.sent_seg = TwoLayerClassifier(config['hidden_size'], len(SENT_SEGMENTATION_TAGS))
+        self.norm_op = TwoLayerClassifier(config['hidden_size'], len(WORD_NORM_OP_TAGS))
 
     def __call__(self, input_ids):
-        return self.word_seg(self.encoder(self.embeddings(input_ids)))
+        # Returns encoder hidden states; callers apply only the heads they need
+        # (same pattern as WordModule, whose heads are applied in Analyzer).
+        return self.encoder(self.embeddings(input_ids))
 
 
 class WordModule(nn.Module):
@@ -113,9 +271,99 @@ class WordModule(nn.Module):
         self.encoder = DeBERTaWithConv(config)
         self.pos_tagger = TwoLayerClassifier(config['hidden_size'], 14)
         self.ne_tagger = TwoLayerClassifier(config['hidden_size'], 17)
+        self.subpos_tagger = TwoLayerClassifier(config['hidden_size'], len(SUBPOS_TAGS))
+        self.conjtype_tagger = TwoLayerClassifier(config['hidden_size'], len(CONJTYPE_TAGS))
+        self.conjform_tagger = TwoLayerClassifier(config['hidden_size'], len(CONJFORM_TAGS))
+        self.reading_tagger = TwoLayerClassifier(config['hidden_size'], len(_reading_id2reading()))
+        self.word_feature_tagger = LoRAMultiLabelHead(config['hidden_size'], len(WORD_FEATURES), rank=4)
+        self.dependency_head = DependencyHead(config['hidden_size'])
+        # Cohesion analysis: 9 relations (7 PAS cases + ノ + coref "="), LoRA rank 1
+        self.cohesion_analyzer = LoRARelationWiseWordSelectionHead(
+            len(COHESION_RELATIONS), config['hidden_size'], rank=1,
+        )
+        # Discourse relation analysis: 7 classes (談話関係なし + 6 relations)
+        self.discourse_relation_analyzer = WordSelectionHead(
+            len(DISCOURSE_RELATIONS), config['hidden_size'],
+        )
 
-    def __call__(self, input_ids):
-        return self.encoder(self.embeddings(input_ids))
+    def __call__(self, input_ids, special_token_indices=None):
+        return self.encoder(self.embeddings(input_ids), special_token_indices=special_token_indices)
+
+
+class LoRAMultiLabelHead(nn.Module):
+    """KWJA LoRASequenceMultiLabelingHead: sigmoid probabilities with a
+    per-label low-rank delta (dense_a/dense_b, rank 4) added to the dense path."""
+
+    def __init__(self, hidden_size: int, num_labels: int, rank: int = 4):
+        super().__init__()
+        self.dense = nn.Linear(hidden_size, hidden_size)
+        # NOTE: plain mx.array attrs are NOT registered params in this mlx
+        # version (no nn.Parameter); load_weights must set them explicitly.
+        self.dense_a = mx.zeros((hidden_size, rank, num_labels))
+        self.dense_b = mx.zeros((rank, hidden_size, num_labels))
+        self.classifier_weight = mx.zeros((hidden_size, num_labels))
+        self.classifier_bias = mx.zeros((num_labels,))
+
+    def __call__(self, x):
+        dense_out = nn.gelu(self.dense(x))  # (B, L, H)
+        delta = mx.einsum('hrl,ril->hil', self.dense_a, self.dense_b)  # (H, H, labels)
+        delta_out = mx.einsum('bsh,hil->bsil', x, delta)  # (B, L, H, labels)
+        hidden = nn.gelu(dense_out[..., :, None] + delta_out)  # (B, L, H, labels)
+        logits = mx.einsum('bshl,hl->bsl', hidden, self.classifier_weight) + self.classifier_bias
+        return mx.sigmoid(logits)
+
+
+MASKED = -np.inf
+_reading_id2reading_cache: Optional[list[str]] = None
+
+
+def _reading_id2reading() -> list[str]:
+    """Reading vocab: id 0 = [UNK], 1 = [ID], then vocab.txt lines (deduped)."""
+    global _reading_id2reading_cache
+    if _reading_id2reading_cache is None:
+        reading2id = get_reading2reading_id()
+        id2reading = [''] * len(reading2id)
+        for reading, rid in reading2id.items():
+            id2reading[rid] = reading
+        _reading_id2reading_cache = id2reading
+    return _reading_id2reading_cache
+
+
+def _decode_morpheme_attributes(pos_preds, subpos_logits, conjtype_logits, conjform_logits):
+    """Masked-argmax decoding (mirrors kwja get_morpheme_attribute_predictions).
+
+    subpos is restricted to the subpos set of the predicted POS; conjform is
+    restricted to the conjform set of the predicted conjtype and only decoded
+    for inflectable (pos, subpos) pairs — otherwise conjtype/conjform → "*".
+    Returns (subpos_preds, conjtype_preds, conjform_preds) label index lists.
+    """
+    n = len(pos_preds)
+    conjtype_preds = [int(x) for x in np.argmax(np.asarray(conjtype_logits), axis=1)]
+    subpos_preds: list[int] = []
+    conjform_preds: list[int] = []
+    for i in range(n):
+        pos_tag = POS_TAGS[pos_preds[i]]
+        possible_subpos = set(POS_TAG_SUBPOS_TAG2SUBPOS_ID[pos_tag])
+        subpos_scores = np.array(subpos_logits[i], dtype=np.float64)
+        for idx, tag in enumerate(SUBPOS_TAGS):
+            if tag not in possible_subpos:
+                subpos_scores[idx] = MASKED
+        subpos_idx = int(np.argmax(subpos_scores))
+        subpos_preds.append(subpos_idx)
+        subpos_tag = SUBPOS_TAGS[subpos_idx]
+        if (pos_tag, subpos_tag) in INFLECTABLE:
+            conjtype_tag = CONJTYPE_TAGS[conjtype_preds[i]]
+            possible_conjform = set(CONJTYPE_TAG_CONJFORM_TAG2CONJFORM_ID[conjtype_tag])
+            conjform_scores = np.array(conjform_logits[i], dtype=np.float64)
+            for idx, tag in enumerate(CONJFORM_TAGS):
+                if tag not in possible_conjform:
+                    conjform_scores[idx] = MASKED
+            conjform_idx = int(np.argmax(conjform_scores))
+        else:
+            conjtype_preds[i] = CONJTYPE_TAGS.index('*')
+            conjform_idx = CONJTYPE_TAG_CONJFORM_TAG2CONJFORM_ID['*']['*']
+        conjform_preds.append(conjform_idx)
+    return subpos_preds, conjtype_preds, conjform_preds
 
 
 class Analyzer:
@@ -148,18 +396,14 @@ class Analyzer:
         char_weights = load_file(char_path)
         char_mapped = {}
         for k, v in char_weights.items():
-            new_k = _remap_deberta_key(k)
-            new_k = new_k.replace('word_segmentation_tagger.layers.0.', 'word_seg.dense.')
-            new_k = new_k.replace('word_segmentation_tagger.layers.3.', 'word_seg.classifier.')
-            if 'sent_seg' in new_k or 'norm_op' in new_k:
-                continue
-            char_mapped[new_k] = v
+            char_mapped[_remap_char_key(k)] = v
         self.char_model = CharModule(char_config)
         self.char_model.load_weights([(k, mx.array(v)) for k, v in char_mapped.items()])
         self.char_tok = AutoTokenizer.from_pretrained(
             'ku-nlp/deberta-v2-base-japanese-char-wwm',
             do_word_tokenize=False, additional_special_tokens=[' ']
         )
+        self._char_special_ids = _special_token_ids(self.char_tok)
 
         # Word module
         word_config = {
@@ -172,8 +416,7 @@ class Analyzer:
         }
         word_path = hf_hub_download(repo, f"{snapshot_base}word_deberta-v2-base.mlx.safetensors")
         word_weights = load_file(word_path)
-        skip_prefixes = ['reading', 'subpos', 'conjtype', 'conjform', 'word_feature',
-                         'base_phrase', 'cohesion', 'dependency', 'discourse']
+        skip_prefixes = ['base_phrase']  # 'dependency' heads now loaded (dependency_head)
         word_mapped = {}
         for k, v in word_weights.items():
             new_k = _remap_deberta_key(k)
@@ -181,6 +424,13 @@ class Analyzer:
             new_k = new_k.replace('pos_tagger.layers.3.', 'pos_tagger.classifier.')
             new_k = new_k.replace('ne_tagger.layers.0.', 'ne_tagger.dense.')
             new_k = new_k.replace('ne_tagger.layers.3.', 'ne_tagger.classifier.')
+            for name in ('subpos_tagger', 'conjtype_tagger', 'conjform_tagger', 'reading_tagger'):
+                new_k = new_k.replace(f'{name}.layers.0.', f'{name}.dense.')
+                new_k = new_k.replace(f'{name}.layers.3.', f'{name}.classifier.')
+            new_k = new_k.replace('word_feature_tagger.delta.', 'word_feature_tagger.')
+            new_k = new_k.replace('dependency_type_parser.layers.0.', 'dependency_head.dependency_type_parser.dense.')
+            new_k = new_k.replace('dependency_type_parser.layers.3.', 'dependency_head.dependency_type_parser.classifier.')
+            new_k = new_k.replace('dependency_parser.', 'dependency_head.dependency_parser.')
             if any(x in new_k for x in skip_prefixes):
                 continue
             word_mapped[new_k] = v
@@ -273,7 +523,8 @@ class Analyzer:
         if not text or not text.strip():
             return []
         enc = self.char_tok(text, return_tensors='np', truncation=True, max_length=512)
-        logits = self.char_model(mx.array(enc['input_ids']))
+        h = self.char_model(mx.array(enc['input_ids']))
+        logits = self.char_model.word_seg(h)
         mx.eval(logits)
         tags = np.array(mx.argmax(logits[0], axis=-1))
         tokens = self.char_tok.convert_ids_to_tokens(enc['input_ids'][0])
@@ -320,7 +571,8 @@ class Analyzer:
                 max_length=512, padding=True,
             )
             input_ids = mx.array(enc['input_ids'])  # (B, L)
-            logits = self.char_model(input_ids)  # (B, L, 2)
+            h = self.char_model(input_ids)  # (B, L, H)
+            logits = self.char_model.word_seg(h)  # (B, L, 2)
             mx.eval(logits)
             all_tags = np.array(mx.argmax(logits, axis=-1))  # (B, L)
 
@@ -347,6 +599,22 @@ class Analyzer:
 
         return results
 
+    def sentences(self, text: str) -> list[list[str]]:
+        """Split text into sentences with the char module's sentence segmentation head.
+
+        Returns a list of sentences, each the list of its character tokens
+        (special tokens filtered out; ''.join(sentence) gives the text).
+        """
+        if not text or not text.strip():
+            return []
+        enc = self.char_tok(text, return_tensors='np', truncation=True, max_length=512)
+        h = self.char_model(mx.array(enc['input_ids']))
+        logits = self.char_model.sent_seg(h)
+        mx.eval(logits)
+        tags = np.array(mx.argmax(logits[0], axis=-1))  # 0 = B (new sentence), 1 = I
+        tokens = self.char_tok.convert_ids_to_tokens(enc['input_ids'][0])
+        return _decode_sentences(tokens, tags, enc['input_ids'][0].tolist(), self._char_special_ids)
+
     def tokenize_batch(self, texts: list[str], batch_size: int = 64) -> list[list[Morpheme]]:
         """Batch tokenization (segment + POS + NER). Much faster than loop.
 
@@ -371,12 +639,21 @@ class Analyzer:
 
         results = [[] for _ in range(len(texts))]
         for orig_idx, tagged in zip(indices, tagged_all):
-            results[orig_idx] = [Morpheme(surface=w, pos=p, ne=n) for w, p, n in tagged]
+            results[orig_idx] = [
+                Morpheme(
+                    surface=w, pos=p, ne=n,
+                    subpos=sp, conjtype=ct, conjform=cf,
+                    reading_cls=r, word_features=wf,
+                )
+                for w, p, n, sp, ct, cf, r, wf in tagged
+            ]
+            add_dependency(self.word_model, results[orig_idx], self.word_tok)
 
         return results
 
-    def tag_batch(self, word_lists: list[list[str]], batch_size: int = 32) -> list[list[tuple[str, str, str]]]:
-        """Batch POS tag and NER for multiple pre-segmented sentences.
+    def tag_batch(self, word_lists: list[list[str]], batch_size: int = 32) -> list[list[tuple]]:
+        """Batch tag pre-segmented sentences: POS, NER, subpos, conjtype,
+        conjform, reading and word features.
 
         Batches the DeBERTa word model forward pass by padding inputs.
         CRF Viterbi decoding remains per-sentence (fast, O(L×K²)).
@@ -386,9 +663,10 @@ class Analyzer:
             batch_size: number of sentences per DeBERTa forward pass
 
         Returns:
-            list of [(word, pos, ne), ...] for each sentence
+            list of [(word, pos, ne, subpos, conjtype, conjform, reading_cls,
+            word_features), ...] for each sentence
         """
-        all_results: list[list[tuple[str, str, str]]] = []
+        all_results: list[list[tuple]] = []
 
         for batch_start in range(0, len(word_lists), batch_size):
             batch_words = word_lists[batch_start:batch_start + batch_size]
@@ -421,54 +699,113 @@ class Analyzer:
 
                 idx = mx.array(np.array(first_idx, dtype=np.int32))
                 pooled = h[j, idx][None, :, :]  # (1, n_words, H)
-
-                pos_logits = self.word_model.pos_tagger(pooled)
-                ne_logits = self.word_model.ne_tagger(pooled)
-                mx.eval(pos_logits, ne_logits)
-
-                pos_preds = np.array(mx.argmax(pos_logits[0], axis=-1))
-                ne_emissions = np.array(ne_logits[0])
-                ne_preds = np.array(self._viterbi_decode(ne_emissions))
-
-                tagged = [
-                    (words[i], POS_TAGS[pos_preds[i]], NE_TAGS[ne_preds[i]])
-                    for i in range(n_words)
-                ]
-                all_results.append(tagged)
+                all_results.append(self._lexical_tag(pooled, words))
 
         return all_results
 
-    def tag(self, words: list[str]) -> list[tuple[str, str, str]]:
-        """POS tag and NER pre-segmented words. Returns [(word, pos, ne), ...]."""
-        if not words:
-            return []
-        enc = self.word_tok(words, is_split_into_words=True, return_tensors='np',
-                            truncation=True, max_length=256)
-        h = self.word_model(mx.array(enc['input_ids']))
-        mx.eval(h)
+    def _lexical_tag(self, pooled: 'mx.array', words: list[str]) -> list[tuple]:
+        """Run all word-level heads on pooled hidden states and decode.
 
-        # First-subword pooling
-        word_ids = enc.word_ids(0)
-        first_idx: list[int] = [0] * len(words)
-        for ti, wid in enumerate(word_ids):
-            if wid is not None and wid < len(words) and first_idx[wid] == 0:
-                first_idx[wid] = ti
-
-        idx = mx.array(np.array(first_idx, dtype=np.int32))
-        pooled = h[0, idx][None, :, :]
-
+        Returns [(word, pos, ne, subpos, conjtype, conjform, reading_cls,
+        word_features), ...].
+        """
+        n_words = len(words)
         pos_logits = self.word_model.pos_tagger(pooled)
         ne_logits = self.word_model.ne_tagger(pooled)
-        mx.eval(pos_logits, ne_logits)
+        subpos_logits = self.word_model.subpos_tagger(pooled)
+        conjtype_logits = self.word_model.conjtype_tagger(pooled)
+        conjform_logits = self.word_model.conjform_tagger(pooled)
+        reading_logits = self.word_model.reading_tagger(pooled)
+        wf_probs = self.word_model.word_feature_tagger(pooled)
+        mx.eval(pos_logits, ne_logits, subpos_logits, conjtype_logits,
+                conjform_logits, reading_logits, wf_probs)
 
         pos_preds = np.array(mx.argmax(pos_logits[0], axis=-1))
         ne_emissions = np.array(ne_logits[0])
         ne_preds = np.array(self._viterbi_decode(ne_emissions))
 
-        return [
-            (words[i], POS_TAGS[pos_preds[i]], NE_TAGS[ne_preds[i]])
-            for i in range(len(words))
-        ]
+        subpos_preds, conjtype_preds, conjform_preds = _decode_morpheme_attributes(
+            pos_preds,
+            np.array(subpos_logits[0]),
+            np.array(conjtype_logits[0]),
+            np.array(conjform_logits[0]),
+        )
+
+        id2reading = _reading_id2reading()
+        reading_preds = np.array(mx.argmax(reading_logits[0], axis=-1))
+        wf_array = np.array(wf_probs[0])  # (n_words, n_features)
+
+        tagged = []
+        for i in range(n_words):
+            reading_id = int(reading_preds[i])
+            # UNK / ID → fall back to the surface string
+            reading_cls = words[i] if reading_id in (0, 1) else id2reading[reading_id]
+            word_features = tuple(
+                WORD_FEATURES[k] for k in range(len(WORD_FEATURES)) if wf_array[i, k] >= 0.5
+            )
+            tagged.append((
+                words[i],
+                POS_TAGS[pos_preds[i]],
+                NE_TAGS[ne_preds[i]],
+                SUBPOS_TAGS[subpos_preds[i]],
+                CONJTYPE_TAGS[conjtype_preds[i]],
+                CONJFORM_TAGS[conjform_preds[i]],
+                reading_cls,
+                word_features,
+            ))
+        return tagged
+
+    def tag(self, words: list[str]) -> list[tuple]:
+        """Tag pre-segmented words: POS, NER, subpos, conjtype, conjform,
+        reading and word features. Returns [(word, pos, ne, subpos, conjtype,
+        conjform, reading_cls, word_features), ...]."""
+        if not words:
+            return []
+        return self.tag_batch([words])[0]
+
+    def analyze_cohesion(self, words: list[str], discourse_threshold: float = 0.0) -> tuple:
+        """Run the cohesion (PAS/橋渡し/共参照) and discourse relation heads.
+
+        Single-sentence input: antecedent candidates are the sentence's own
+        morphemes plus the 7 special tokens (exophora referents, [NULL],
+        [NA], [ROOT]), appended to the encoder input like upstream.
+
+        Returns (per-morpheme cohesion dicts, sentence-level discourse list).
+
+        TODO: document-level analysis. KWJA splits long documents into
+        overlapping sub-documents (document_split_stride=2: each sub-document
+        reuses the last 2 sentences of the previous one as left context and
+        only decodes those trailing "target" sentences); this port decodes
+        each sentence independently.
+        """
+        if not words:
+            return [], []
+        # Token layout mirrors upstream: [CLS] + morpheme subwords + [SEP]
+        # + 7 special tokens (+ padding), truncated so the total fits 256.
+        enc = self.word_tok(
+            words, is_split_into_words=True, return_tensors='np',
+            truncation=True, max_length=256 - len(SPECIALS),
+        )
+        special_ids = self.word_tok.convert_tokens_to_ids(list(SPECIALS))
+        sub_ids = enc['input_ids'][0]
+        input_ids = np.concatenate([sub_ids, np.array(special_ids, dtype=sub_ids.dtype)])
+        special_token_indices = list(range(len(sub_ids), len(input_ids)))
+        h = self.word_model(mx.array(input_ids[None, :]), special_token_indices=special_token_indices)
+        mx.eval(h)
+
+        # First-subword pooling for morphemes; last positions for specials.
+        word_ids = enc.word_ids(0)
+        first_idx: list[int] = [0] * len(words)
+        for ti, wid in enumerate(word_ids):
+            if wid is not None and wid < len(words) and first_idx[wid] == 0:
+                first_idx[wid] = ti
+        pool_idx = mx.array(np.array(first_idx + special_token_indices, dtype=np.int32))
+        pooled = h[0, pool_idx][None, :, :]  # (1, n_words + 7, H)
+        return analyze_heads(
+            self.word_model.cohesion_analyzer,
+            self.word_model.discourse_relation_analyzer,
+            pooled, len(words), discourse_threshold=discourse_threshold,
+        )
 
     def read(self, words: list[str]) -> list[tuple[str, str, str, str]]:
         """Get reading, lemma, canon for words using seq2seq T5.
@@ -505,8 +842,9 @@ class Analyzer:
                 results.append((m.split('<extra_id_')[0], '', '', ''))
         return results
 
-    def analyze(self, text: str, with_reading: bool = True) -> AnalysisResult:
-        """Full analysis pipeline: segmentation → POS/NER → reading/lemma."""
+    def analyze(self, text: str, with_reading: bool = True, with_cohesion: bool = True) -> AnalysisResult:
+        """Full analysis pipeline: segmentation → POS/NER → reading/lemma
+        → cohesion/discourse relations."""
         if not text or not text.strip():
             return AnalysisResult(text=text or "", morphemes=[])
 
@@ -521,23 +859,45 @@ class Analyzer:
         if with_reading:
             readings = self.read(words)
 
+        # Step 4: Cohesion + discourse relations (optional, one DeBERTa pass)
+        cohesion_rels: list = []
+        discourse: list = []
+        if with_cohesion and words:
+            cohesion_rels, discourse = self.analyze_cohesion(words)
+
         # Build result
         morphemes = []
-        for i, (word, pos, ne) in enumerate(tagged):
-            m = Morpheme(surface=word, pos=pos, ne=ne)
+        for i, (word, pos, ne, subpos, conjtype, conjform, reading_cls, word_features) in enumerate(tagged):
+            m = Morpheme(
+                surface=word, pos=pos, ne=ne,
+                subpos=subpos, conjtype=conjtype, conjform=conjform,
+                reading_cls=reading_cls, word_features=word_features,
+            )
             if readings and i < len(readings):
                 _, reading, lemma, canon = readings[i]
                 m.reading = reading
                 m.lemma = lemma
                 m.canon = canon
+            if i < len(cohesion_rels):
+                m.cohesion = cohesion_rels[i]
             morphemes.append(m)
+        add_dependency(self.word_model, morphemes, self.word_tok)
 
-        return AnalysisResult(text=text, morphemes=morphemes)
+        return AnalysisResult(text=text, morphemes=morphemes, discourse=discourse)
 
     def tokenize(self, text: str) -> list[Morpheme]:
-        """Quick segmentation + POS (no reading). Fastest mode."""
+        """Quick segmentation + lexical tagging (no seq2seq reading). Fastest mode."""
         if not text or not text.strip():
             return []
         words = self.segment(text)
         tagged = self.tag(words)
-        return [Morpheme(surface=w, pos=p, ne=n) for w, p, n in tagged]
+        morphemes = [
+            Morpheme(
+                surface=w, pos=p, ne=n,
+                subpos=sp, conjtype=ct, conjform=cf,
+                reading_cls=r, word_features=wf,
+            )
+            for w, p, n, sp, ct, cf, r, wf in tagged
+        ]
+        add_dependency(self.word_model, morphemes, self.word_tok)
+        return morphemes
