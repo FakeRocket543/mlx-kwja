@@ -6,3 +6,5 @@ dist/
 models/
 .omc/
 uv.lock
+.pytest_cache/
+.ruff_cache/
