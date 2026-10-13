@@ -5,9 +5,9 @@ from dataclasses import dataclass
 from typing import Optional
 
 import mlx.core as mx
-from mlx import nn
 import numpy as np
 from huggingface_hub import hf_hub_download
+from mlx import nn
 from safetensors.numpy import load_file
 from transformers import AutoTokenizer
 

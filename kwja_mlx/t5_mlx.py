@@ -3,8 +3,8 @@
 from typing import Optional
 
 import mlx.core as mx
-from mlx import nn
 import numpy as np
+from mlx import nn
 
 
 class T5RelativePositionBias(nn.Module):
