@@ -19,6 +19,7 @@ from kwja_mlx.analyzer import (
     _decode_morpheme_attributes,
 )
 from kwja_mlx.constants import (
+    BASE_PHRASE_FEATURES,
     CONJFORM_TAGS,
     CONJTYPE_TAG_CONJFORM_TAG2CONJFORM_ID,
     CONJTYPE_TAGS,
@@ -199,6 +200,12 @@ class TestLexicalTag:
                            'bias': mx.array(np.zeros(12907, dtype=np.float32))},
         })
         a.word_model = m
+        a.word_model.base_phrase_feature_tagger.update({
+            'dense_a': mx.array(np.zeros((n_hidden, 4, len(BASE_PHRASE_FEATURES)), dtype=np.float32)),
+            'dense_b': mx.array(np.zeros((4, n_hidden, len(BASE_PHRASE_FEATURES)), dtype=np.float32)),
+            'classifier_weight': mx.array(np.zeros((n_hidden, len(BASE_PHRASE_FEATURES)), dtype=np.float32)),
+            'classifier_bias': mx.array(np.zeros(len(BASE_PHRASE_FEATURES), dtype=np.float32)),
+        })
         a.crf_start = np.zeros(17, dtype=np.float32)
         a.crf_end = np.zeros(17, dtype=np.float32)
         a.crf_trans = np.zeros((17, 17), dtype=np.float32)
@@ -211,8 +218,8 @@ class TestLexicalTag:
         tagged = a._lexical_tag(pooled, words)
         assert len(tagged) == 2
         for row in tagged:
-            assert len(row) == 8
-            surface, pos, ne, subpos, conjtype, conjform, reading_cls, wf = row
+            assert len(row) == 9
+            surface, pos, ne, subpos, conjtype, conjform, reading_cls, wf, bpf = row
             assert subpos in POS_TAG_SUBPOS_TAG2SUBPOS_ID[pos]
             assert conjtype in CONJTYPE_TAGS
             if (pos, subpos) in INFLECTABLE:
@@ -223,6 +230,8 @@ class TestLexicalTag:
             assert reading_cls == surface or reading_cls in id2r
             assert set(wf).issubset(set(WORD_FEATURES))
             assert isinstance(wf, tuple)
+            assert set(bpf).issubset(set(BASE_PHRASE_FEATURES))
+            assert isinstance(bpf, tuple)
 
 
 class TestWordFeatureLoadingKeys:

@@ -17,6 +17,7 @@ from kwja_mlx.cohesion import (
     analyze_heads,
 )
 from kwja_mlx.constants import (
+    BASE_PHRASE_FEATURES,
     CHOON_SET,
     COHESION_RELATIONS,
     CONJFORM_TAGS,
@@ -67,6 +68,7 @@ class Morpheme:
     conjform: str = "*"
     reading_cls: Optional[str] = None
     word_features: tuple[str, ...] = ()
+    base_phrase_features: tuple[str, ...] = ()
     # {relation: antecedent morpheme index (endophora) | exophora referent str}
     cohesion: dict = field(default_factory=dict)
     parent_index: Optional[int] = None  # parent base-phrase index (-1 = root)
@@ -276,6 +278,8 @@ class WordModule(nn.Module):
         self.conjform_tagger = TwoLayerClassifier(config['hidden_size'], len(CONJFORM_TAGS))
         self.reading_tagger = TwoLayerClassifier(config['hidden_size'], len(_reading_id2reading()))
         self.word_feature_tagger = LoRAMultiLabelHead(config['hidden_size'], len(WORD_FEATURES), rank=4)
+        # Base-phrase features (64 KNP features incl 節-区切/節-主辞): same LoRA multi-label head
+        self.base_phrase_feature_tagger = LoRAMultiLabelHead(config['hidden_size'], len(BASE_PHRASE_FEATURES), rank=4)
         self.dependency_head = DependencyHead(config['hidden_size'])
         # Cohesion analysis: 9 relations (7 PAS cases + ノ + coref "="), LoRA rank 1
         self.cohesion_analyzer = LoRARelationWiseWordSelectionHead(
@@ -366,6 +370,28 @@ def _decode_morpheme_attributes(pos_preds, subpos_logits, conjtype_logits, conjf
     return subpos_preds, conjtype_preds, conjform_preds
 
 
+def _decode_clauses(n_words: int, bp_array: np.ndarray) -> list[tuple[int, int, int]]:
+    """Split word indices into clauses from 節-区切* (mirrors kwja add_base_phrase_features).
+
+    Returns [(start, end_exclusive, head_idx), ...] where head_idx has max 節-主辞 prob.
+    Last clause is force-closed if no boundary fires (upstream behaviour).
+    """
+    try:
+        head_col = BASE_PHRASE_FEATURES.index("節-主辞")
+    except ValueError:
+        return [(0, n_words, 0)] if n_words else []
+    bound_cols = [k for k, f in enumerate(BASE_PHRASE_FEATURES) if f.startswith("節-区切")]
+    clauses = []
+    start = 0
+    for i in range(n_words):
+        if any(bp_array[i, c] >= 0.5 for c in bound_cols):
+            clauses.append((start, i + 1, start + int(np.argmax(bp_array[start:i + 1, head_col]))))
+            start = i + 1
+    if start < n_words:
+        clauses.append((start, n_words, start + int(np.argmax(bp_array[start:, head_col]))))
+    return clauses
+
+
 class Analyzer:
     """Full KWJA-MLX pipeline: char → word → seq2seq."""
 
@@ -416,7 +442,7 @@ class Analyzer:
         }
         word_path = hf_hub_download(repo, f"{snapshot_base}word_deberta-v2-base.mlx.safetensors")
         word_weights = load_file(word_path)
-        skip_prefixes = ['base_phrase']  # 'dependency' heads now loaded (dependency_head)
+        skip_prefixes: list = []  # all word heads now loaded (incl base_phrase)
         word_mapped = {}
         for k, v in word_weights.items():
             new_k = _remap_deberta_key(k)
@@ -428,6 +454,7 @@ class Analyzer:
                 new_k = new_k.replace(f'{name}.layers.0.', f'{name}.dense.')
                 new_k = new_k.replace(f'{name}.layers.3.', f'{name}.classifier.')
             new_k = new_k.replace('word_feature_tagger.delta.', 'word_feature_tagger.')
+            new_k = new_k.replace('base_phrase_feature_tagger.delta.', 'base_phrase_feature_tagger.')
             new_k = new_k.replace('dependency_type_parser.layers.0.', 'dependency_head.dependency_type_parser.dense.')
             new_k = new_k.replace('dependency_type_parser.layers.3.', 'dependency_head.dependency_type_parser.classifier.')
             new_k = new_k.replace('dependency_parser.', 'dependency_head.dependency_parser.')
@@ -644,8 +671,9 @@ class Analyzer:
                     surface=w, pos=p, ne=n,
                     subpos=sp, conjtype=ct, conjform=cf,
                     reading_cls=r, word_features=wf,
+                    base_phrase_features=bpf,
                 )
-                for w, p, n, sp, ct, cf, r, wf in tagged
+                for w, p, n, sp, ct, cf, r, wf, bpf in tagged
             ]
             add_dependency(self.word_model, results[orig_idx], self.word_tok)
 
@@ -707,7 +735,7 @@ class Analyzer:
         """Run all word-level heads on pooled hidden states and decode.
 
         Returns [(word, pos, ne, subpos, conjtype, conjform, reading_cls,
-        word_features), ...].
+        word_features, base_phrase_features), ...].
         """
         n_words = len(words)
         pos_logits = self.word_model.pos_tagger(pooled)
@@ -717,8 +745,9 @@ class Analyzer:
         conjform_logits = self.word_model.conjform_tagger(pooled)
         reading_logits = self.word_model.reading_tagger(pooled)
         wf_probs = self.word_model.word_feature_tagger(pooled)
+        bp_probs = self.word_model.base_phrase_feature_tagger(pooled)
         mx.eval(pos_logits, ne_logits, subpos_logits, conjtype_logits,
-                conjform_logits, reading_logits, wf_probs)
+                conjform_logits, reading_logits, wf_probs, bp_probs)
 
         pos_preds = np.array(mx.argmax(pos_logits[0], axis=-1))
         ne_emissions = np.array(ne_logits[0])
@@ -734,6 +763,7 @@ class Analyzer:
         id2reading = _reading_id2reading()
         reading_preds = np.array(mx.argmax(reading_logits[0], axis=-1))
         wf_array = np.array(wf_probs[0])  # (n_words, n_features)
+        bp_array = np.array(bp_probs[0])  # (n_words, 64)
 
         tagged = []
         for i in range(n_words):
@@ -742,6 +772,9 @@ class Analyzer:
             reading_cls = words[i] if reading_id in (0, 1) else id2reading[reading_id]
             word_features = tuple(
                 WORD_FEATURES[k] for k in range(len(WORD_FEATURES)) if wf_array[i, k] >= 0.5
+            )
+            base_phrase_features = tuple(
+                BASE_PHRASE_FEATURES[k] for k in range(len(BASE_PHRASE_FEATURES)) if bp_array[i, k] >= 0.5
             )
             tagged.append((
                 words[i],
@@ -752,6 +785,7 @@ class Analyzer:
                 CONJFORM_TAGS[conjform_preds[i]],
                 reading_cls,
                 word_features,
+                base_phrase_features,
             ))
         return tagged
 
@@ -867,11 +901,12 @@ class Analyzer:
 
         # Build result
         morphemes = []
-        for i, (word, pos, ne, subpos, conjtype, conjform, reading_cls, word_features) in enumerate(tagged):
+        for i, (word, pos, ne, subpos, conjtype, conjform, reading_cls, word_features, base_phrase_features) in enumerate(tagged):
             m = Morpheme(
                 surface=word, pos=pos, ne=ne,
                 subpos=subpos, conjtype=conjtype, conjform=conjform,
                 reading_cls=reading_cls, word_features=word_features,
+                base_phrase_features=base_phrase_features,
             )
             if readings and i < len(readings):
                 _, reading, lemma, canon = readings[i]
@@ -896,8 +931,9 @@ class Analyzer:
                 surface=w, pos=p, ne=n,
                 subpos=sp, conjtype=ct, conjform=cf,
                 reading_cls=r, word_features=wf,
+                base_phrase_features=bpf,
             )
-            for w, p, n, sp, ct, cf, r, wf in tagged
+            for w, p, n, sp, ct, cf, r, wf, bpf in tagged
         ]
         add_dependency(self.word_model, morphemes, self.word_tok)
         return morphemes
