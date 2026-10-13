@@ -140,3 +140,22 @@ Output: 岸田(きしだ), 首相(しゅしょう), が(が), 記者(きしゃ),
 - RMSNorm (no bias) for all layer norms
 - Relative position bias shared from layer 0 (32 buckets × 12 heads)
 - Autoregressive decoding with KV cache
+
+## Full Pipeline Rerun (2026-10-13, post-completion)
+
+`scripts/benchmark_wikipedia.py` on 12 Wikipedia + NER sentences, all 4 precisions:
+
+| Mode | Segment | Tokenize | Analyze | BIO err | NER recall |
+|------|---------|----------|---------|---------|------------|
+| FP32 | 99 | 30 | 2.0 | 0 | 100% (4/4) |
+| FP16 | 109 | 33 | 1.5 | 0 | 100% |
+| Q8 | 126 | 41 | 2.7 | 0 | 100% |
+| Q4 | 149 | 42 | 2.9 | 0 | 100% |
+
+New heads smoke (q8, linguistically verified):
+- `食べた` → 動詞/母音動詞/タ形/たべた (masked-argmax legal combo)
+- `私は学生です` → 私は→学生です→ROOT, types D (base-phrase index, -1 = root)
+- `彼が東京に行った` → 行った ガ→彼 ニ→東京; 彼 ノ→彼 =→彼
+- `行ったが…` → discourse 逆接 on correct clause pair
+- `天気がいいから、散歩しよう` → いい 用言:形/非過去/節-主辞/節-区切; しよう 意志/勧誘/節-区切
+- `田中さんが来た。彼は笑った。` (analyze_document) → 笑った ガ→彼 cross-sentence (flat index)
